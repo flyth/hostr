@@ -417,11 +417,12 @@ func (s *Server) handlePatchSite(w http.ResponseWriter, r *http.Request, c calle
 		return
 	}
 	var req struct {
-		Domain     *string `json:"domain"`
-		Listing    *bool   `json:"listing"`
-		ScopedOnly *bool   `json:"scoped_only"`
-		AuthUser   *string `json:"auth_user"`
-		AuthPass   *string `json:"auth_password"`
+		Domain        *string `json:"domain"`
+		Listing       *bool   `json:"listing"`
+		ListingNoRoot *bool   `json:"listing_no_root"`
+		ScopedOnly    *bool   `json:"scoped_only"`
+		AuthUser      *string `json:"auth_user"`
+		AuthPass      *string `json:"auth_password"`
 	}
 	if !readJSON(w, r, &req) {
 		return
@@ -457,8 +458,9 @@ func (s *Server) handlePatchSite(w http.ResponseWriter, r *http.Request, c calle
 			return
 		}
 	}
-	if req.Listing != nil || req.ScopedOnly != nil {
-		if err := s.db.SetSiteSettings(site.ID, req.Listing, req.ScopedOnly); err != nil {
+	set := siteSettings{Listing: req.Listing, ListingNoRoot: req.ListingNoRoot, ScopedOnly: req.ScopedOnly}
+	if !set.empty() {
+		if err := s.db.SetSiteSettings(site.ID, set); err != nil {
 			writeStoreErr(w, err)
 			return
 		}
@@ -824,8 +826,27 @@ func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request, c ca
 
 // ---- tokens ----
 
+// tokenView adds the one thing the stored record cannot show on its own: the
+// slug behind a site ID. What a token is limited to is the whole point of
+// listing it, so the limits have to be readable without a second lookup.
+type tokenView struct {
+	*Token
+	SiteSlug string `json:"site_slug,omitempty"`
+}
+
 func (s *Server) handleListTokens(w http.ResponseWriter, r *http.Request, u *User) {
-	writeJSON(w, http.StatusOK, s.db.Tokens(u.ID))
+	tokens := s.db.Tokens(u.ID)
+	out := make([]tokenView, 0, len(tokens))
+	for _, t := range tokens {
+		v := tokenView{Token: t}
+		// A token outliving the site it was bound to keeps the bare ID rather
+		// than silently reading as account-wide.
+		if site := s.db.Site(t.Site); site != nil {
+			v.SiteSlug = site.Slug
+		}
+		out = append(out, v)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request, u *User) {

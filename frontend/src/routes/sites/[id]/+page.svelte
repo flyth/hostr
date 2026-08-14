@@ -1,7 +1,8 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
-  import { get, post, patch, del, humanBytes, ago, type Listing, type Site } from '$lib/api';
+  import { get, post, patch, del, humanBytes, ago, type Listing, type Site, type Token } from '$lib/api';
+  import TokenLimits from '$lib/TokenLimits.svelte';
   import { session } from '$lib/session.svelte';
   import { mount as mountBrowser } from '$lib/browser.js';
   import '$lib/browser.css';
@@ -9,6 +10,7 @@
   const id = $derived(page.params.id!);
 
   let site = $state<Site | null>(null);
+  let tokens = $state<Token[]>([]);
   let error = $state('');
   let notice = $state('');
   let domain = $state('');
@@ -19,6 +21,8 @@
   let tokenName = $state('');
   let newToken = $state('');
   let browserEl = $state<HTMLDivElement | null>(null);
+  let browserDialog = $state<HTMLDialogElement | null>(null);
+  let browserOpen = $state(false);
 
   const canManage = $derived(!!site && (site.mine || !!session.me?.admin));
   const collaborators = $derived(site?.collaborators ?? []);
@@ -33,15 +37,35 @@
     }
   }
 
+  // Tokens are the caller's own — the endpoint never returns anyone else's, so
+  // the site view is your tokens for this site, not every token that can reach
+  // it. Filtered here rather than server side: the list is a handful of rows
+  // the panel has already fetched for the account page.
+  async function loadTokens(siteId: string) {
+    let next: Token[] = [];
+    try {
+      next = ((await get<Token[]>('/api/tokens')) ?? []).filter((t) => t.site === siteId);
+    } catch {
+      // A failure here should not blank the page; the site itself still loaded.
+    }
+    // Two sites opened in quick succession race, and the slower response must
+    // not paint one site's tokens onto the other's page.
+    if (siteId === id) tokens = next;
+  }
+
   // Keyed off `id` rather than onMount: SvelteKit reuses this component across
   // param changes, so a history or address-bar jump between two sites would
   // otherwise keep showing the first one.
   $effect(() => {
     load(id);
+    loadTokens(id);
   });
 
   // The browser is a plain DOM module shared with the public listing pages, so
-  // it is mounted by hand rather than composed as a component.
+  // it is mounted by hand rather than composed as a component. It lives in a
+  // dialog for the same reason the public page gives it the whole viewport: the
+  // two panes size themselves against their container, and a short box inside a
+  // scrolling page leaves them fighting each other for the scroll.
   $effect(() => {
     const el = browserEl;
     if (!el) return;
@@ -60,6 +84,13 @@
     });
   });
 
+  // showModal rather than an open attribute: the backdrop, the focus trap and
+  // Escape all come with it, and none of them are worth reimplementing.
+  function openBrowser() {
+    browserOpen = true;
+    browserDialog?.showModal();
+  }
+
   async function act(fn: () => Promise<unknown>, msg = '') {
     error = '';
     notice = '';
@@ -75,7 +106,7 @@
   const saveDomain = () =>
     act(() => patch(`/api/sites/${id}`, { domain: domain.trim() }), 'Domain updated.');
 
-  const toggle = (field: 'listing' | 'scoped_only', value: boolean) =>
+  const toggle = (field: 'listing' | 'listing_no_root' | 'scoped_only', value: boolean) =>
     act(() => patch(`/api/sites/${id}`, { [field]: value }), 'Setting saved.');
 
   const saveAuth = () =>
@@ -111,6 +142,18 @@
       });
       newToken = res.token;
       tokenName = '';
+      tokenScope = '';
+      await loadTokens(id);
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  async function revokeToken(tokenId: string) {
+    error = '';
+    try {
+      await del(`/api/tokens/${tokenId}`);
+      await loadTokens(id);
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
     }
@@ -163,10 +206,31 @@ hostrctl push   -site {site.slug} -scope my-website render.png</pre>
     </p>
   </section>
 
-  <section class="card mb-6 p-0">
-    <h2 class="border-edge border-b p-4 text-sm font-semibold tracking-wide uppercase">Files</h2>
-    <div class="h-[28rem]" bind:this={browserEl}></div>
+  <section class="card mb-6 flex flex-wrap items-center justify-between gap-3 p-4">
+    <div>
+      <h2 class="text-sm font-semibold tracking-wide uppercase">Files</h2>
+      <p class="text-mute mt-1 text-xs">
+        {site.files} files · {humanBytes(site.bytes)} · browse, preview and delete.
+      </p>
+    </div>
+    <button class="btn" onclick={openBrowser}>Open file browser</button>
   </section>
+
+  <dialog
+    class="browser-modal"
+    bind:this={browserDialog}
+    onclose={() => (browserOpen = false)}
+  >
+    {#if browserOpen}
+      <div class="bg-panel border-edge flex h-full flex-col overflow-hidden rounded border">
+        <div class="border-edge flex items-center justify-between gap-3 border-b p-3">
+          <h2 class="text-sm font-semibold tracking-wide uppercase">{site.slug} files</h2>
+          <button class="btn text-xs" onclick={() => browserDialog?.close()}>Close</button>
+        </div>
+        <div class="min-h-0 flex-1" bind:this={browserEl}></div>
+      </div>
+    {/if}
+  </dialog>
 
   {#if canManage}
     <section class="card mb-6 space-y-4 p-4">
@@ -195,6 +259,24 @@ hostrctl push   -site {site.slug} -scope my-website render.png</pre>
           </span>
         </span>
       </label>
+
+      {#if site.listing}
+        <label class="ml-6 flex items-start gap-2 text-sm">
+          <input
+            type="checkbox"
+            class="mt-1"
+            checked={site.listing_no_root}
+            onchange={(e) => toggle('listing_no_root', e.currentTarget.checked)}
+          />
+          <span>
+            Except the root folder
+            <span class="text-mute block text-xs">
+              Browsing starts at a directory someone already knows. The root stays a 404, so the
+              site cannot be walked from the top.
+            </span>
+          </span>
+        </label>
+      {/if}
 
       <label class="flex items-start gap-2 text-sm">
         <input
@@ -277,6 +359,26 @@ hostrctl push   -site {site.slug} -scope my-website render.png</pre>
           <p class="text-mute mt-2 text-xs">Shown once — copy it now.</p>
           <pre class="bg-ink border-edge mt-1 overflow-x-auto rounded border p-3 text-xs">{newToken}</pre>
         {/if}
+
+        <ul class="mt-3 space-y-1">
+          {#each tokens as t (t.id)}
+            <li class="border-edge flex items-center justify-between gap-3 border-t pt-2 text-sm">
+              <span class="min-w-0">
+                {t.name}
+                <span class="text-mute text-xs">· last used {ago(t.last_used)}</span>
+                <span class="block"><TokenLimits token={t} /></span>
+              </span>
+              <button class="btn btn-danger shrink-0 text-xs" onclick={() => revokeToken(t.id)}>
+                Revoke
+              </button>
+            </li>
+          {:else}
+            <li class="text-mute mt-2 text-xs">
+              None of your tokens are bound to this site. Tokens belonging to other people are not
+              listed here.
+            </li>
+          {/each}
+        </ul>
       </div>
 
       <div class="border-edge border-t pt-4">
@@ -285,3 +387,22 @@ hostrctl push   -site {site.slug} -scope my-website render.png</pre>
     </section>
   {/if}
 {/if}
+
+<style>
+  /* The browser sizes its panes against its container, so the dialog has to be
+     a fixed height rather than one that grows with the listing. */
+  .browser-modal {
+    width: min(72rem, 94vw);
+    height: 88vh;
+    margin: auto;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    overflow: visible;
+  }
+
+  .browser-modal::backdrop {
+    background: rgb(0 0 0 / 0.6);
+  }
+</style>

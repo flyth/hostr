@@ -41,7 +41,7 @@ func (s *Server) serveSite(w http.ResponseWriter, r *http.Request, site *Site) {
 	if req != "" && !strings.HasSuffix(r.URL.Path, "/") {
 		if _, direct := m.Files[req]; !direct {
 			_, isDir := m.Files[req+"/index.html"]
-			if !isDir && site.Listing {
+			if !isDir && site.listable(req) {
 				isDir = m.HasDir(req)
 			}
 			if isDir {
@@ -59,7 +59,7 @@ func (s *Server) serveSite(w http.ResponseWriter, r *http.Request, site *Site) {
 	}
 	// A real directory with no index of its own. Only once the site has opted
 	// in — listing turns every path into something a stranger can enumerate.
-	if site.Listing && m.HasDir(req) {
+	if site.listable(req) && m.HasDir(req) {
 		s.serveListingPage(w, r, site, req)
 		return
 	}
@@ -67,9 +67,10 @@ func (s *Server) serveSite(w http.ResponseWriter, r *http.Request, site *Site) {
 }
 
 // serveListingJSON feeds the browser page. It is the same disclosure as the
-// page itself, so it is gated on the same flag.
+// page itself, so it is gated on the same rule — including the root, which the
+// page would otherwise be denied and the feed would hand over anyway.
 func (s *Server) serveListingJSON(w http.ResponseWriter, site *Site, m *Manifest, dir string) {
-	if !site.Listing {
+	if !site.listable(dir) {
 		http.Error(w, "404 not found", http.StatusNotFound)
 		return
 	}
@@ -94,7 +95,7 @@ func (s *Server) serveListingPage(w http.ResponseWriter, r *http.Request, site *
 	// No path or filename is interpolated into markup — the shell is static
 	// and every name arrives later as JSON, so there is nothing here for a
 	// hostile filename to break out of.
-	_, _ = w.Write(listingPage(dir, site.Domain))
+	_, _ = w.Write(listingPage(dir, site.Domain, site.ListingNoRoot))
 }
 
 // resolve maps a request path onto a manifest entry, trying the file itself,

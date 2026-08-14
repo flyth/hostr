@@ -17,6 +17,7 @@
  * @property {(path: string) => string} href URL that serves the file at `path`
  * @property {(path: string, isDir: boolean) => Promise<unknown>} [remove] its presence turns on delete controls
  * @property {(dir: string) => void} [onNavigate]
+ * @property {boolean} [noRoot] the root is not listable here, so never offer a way back to it
  */
 
 const IMAGE = /\.(png|jpe?g|gif|webp|avif|bmp|ico|svg)$/i;
@@ -81,6 +82,10 @@ function message(err) {
  */
 export function mount(root, opts) {
   const remove = opts.remove;
+  // A site that withholds its root listing would answer the walk-up with a 404
+  // and leave the address bar pointing at it, so the ways up stop one level
+  // short instead of offering a door that is not there.
+  const noRoot = !!opts.noRoot;
 
   let dir = opts.path || '';
   /** @type {BrowserEntry[]} */
@@ -136,9 +141,13 @@ export function mount(root, opts) {
   function drawCrumbs() {
     crumbs.replaceChildren();
     const parts = dir ? dir.split('/') : [];
-    const rootBtn = el('button', null, '/');
-    rootBtn.onclick = () => navigate('');
-    crumbs.append(rootBtn);
+    if (noRoot) {
+      crumbs.append(el('span', null, '/'));
+    } else {
+      const rootBtn = el('button', null, '/');
+      rootBtn.onclick = () => navigate('');
+      crumbs.append(rootBtn);
+    }
     parts.forEach((part, i) => {
       const target = parts.slice(0, i + 1).join('/');
       const btn = el('button', null, part);
@@ -313,7 +322,9 @@ export function mount(root, opts) {
 
   function up() {
     if (!dir) return;
-    navigate(dir.split('/').slice(0, -1).join('/'));
+    const parent = dir.split('/').slice(0, -1).join('/');
+    if (!parent && noRoot) return;
+    navigate(parent);
   }
 
   list.addEventListener('keydown', (ev) => {

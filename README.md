@@ -191,6 +191,17 @@ Turning it on makes every path in the site enumerable. That is the entire point
 of the feature and also the entire risk of it: anything that was only protected
 by having an unguessable URL stops being protected.
 
+The root can be held back from that:
+
+```sh
+hostrctl settings -site playground -no-root-listing=true
+```
+
+Every directory below it still lists, but `/` is a 404 again — so a visitor
+browses from a path they were given, and nobody walks the site from the top.
+This pairs with scoped tokens: each scope keeps its own browsable subtree
+without the scope names themselves being on display at the root.
+
 ## Password protection
 
 A site can sit behind a basic auth prompt, pages and listings alike:
