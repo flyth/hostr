@@ -3,7 +3,7 @@
 # emulated npm install under QEMU.
 
 # 1. Build the control panel. Its output is just files — no architecture.
-FROM --platform=$BUILDPLATFORM node:22-alpine AS web
+FROM --platform=$BUILDPLATFORM node:26-alpine AS web
 WORKDIR /src
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
