@@ -1,0 +1,9 @@
+bin/
+data/
+web/*
+!web/placeholder.html
+frontend/node_modules/
+frontend/build/
+frontend/.svelte-kit/
+.git/
+*.md

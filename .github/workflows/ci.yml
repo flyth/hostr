@@ -1,0 +1,143 @@
+name: CI
+
+# Tests on every push and PR. Builds the container image every time too — a
+# Dockerfile that only gets exercised on release is a Dockerfile that breaks on
+# release — but only pushes it to GHCR from main and from version tags.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Check the control panel
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run check
+          npm run build
+
+      # go:embed needs web/ populated to compile anything but the placeholder,
+      # so the SPA build has to land before the Go build.
+      - name: Embed the control panel
+        run: |
+          find web -mindepth 1 ! -name placeholder.html -delete
+          cp -R frontend/build/. web/
+
+      - name: Vet and test
+        run: |
+          test -z "$(gofmt -l .)" || { echo "gofmt found unformatted files:"; gofmt -l .; exit 1; }
+          go vet ./...
+          go test -race ./...
+
+      - name: Build both binaries
+        run: |
+          CGO_ENABLED=0 go build -trimpath -o /dev/null .
+          CGO_ENABLED=0 go build -trimpath -o /dev/null ./cmd/hostrctl
+
+  docker:
+    name: image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # No credentials on a pull request from a fork, and nothing to push
+      # anyway — the build alone is the signal there.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Work out tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Build the native arch into the local daemon first so the image can
+      # actually be run. `FROM scratch` plus a non-root user is the kind of
+      # thing that only fails at runtime, and it should fail on the PR.
+      - name: Build for smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: hostr:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run it
+        run: |
+          docker run -d --name hostr-smoke -p 8080:8080 \
+            -e HOSTR_ADMIN_PASSWORD=ci-smoke-test-password hostr:ci
+          for _ in $(seq 30); do
+            if curl -fsS -o /dev/null http://127.0.0.1:8080/; then
+              echo "control panel answered"
+              # Proves the unprivileged user can actually write to /data.
+              docker logs hostr-smoke 2>&1 | grep -q 'created admin user' \
+                || { echo "admin bootstrap never happened"; docker logs hostr-smoke; exit 1; }
+              docker rm -f hostr-smoke
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "container never became ready:"; docker logs hostr-smoke; exit 1
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # The Dockerfile cross-compiles from the build platform, so the second
+          # architecture costs a Go link rather than an emulated npm install.
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

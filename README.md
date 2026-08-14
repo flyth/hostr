@@ -1,0 +1,156 @@
+# hostr
+
+A small static-site host you can share with friends. One container serves any
+number of sites, each on its own domain, each owned by a different account.
+`hostrctl` syncs a build directory to a site over plain HTTPS — only the files
+whose contents actually changed get uploaded, and anything you deleted locally
+gets deleted on the server.
+
+```
+hostrctl deploy -site blog ./build
+./build -> blog.example.com
+  128 files, 3 new, 2 changed, 1 to delete
+  5 blobs to upload (412.0 KB), 123 already on server
+  uploading 5/5
+deployed v7: 128 files, 4.1 MB live, 3 stale blobs collected
+```
+
+## Running it
+
+CI publishes a multi-arch image (amd64 + arm64) to GHCR on every push to main
+and on every `v*` tag:
+
+```sh
+docker pull ghcr.io/<owner>/<repo>:latest     # or :v1.2.3, or :<full-sha>
+```
+
+Or build it yourself:
+
+```sh
+docker build -t hostr .
+docker run -d --name hostr \
+  -p 8080:8080 \
+  -v hostr-data:/data \
+  -e HOSTR_ADMIN_DOMAIN=admin.example.com \
+  -e HOSTR_ADMIN_USER=you \
+  -e HOSTR_ADMIN_PASSWORD='something long' \
+  hostr
+```
+
+Put a TLS-terminating reverse proxy in front (Caddy, nginx, Traefik) and point
+it at `:8080` for the admin domain and every site domain. `hostr` speaks plain
+HTTP only — TLS, HTTP/2 and compression are the proxy's job, and it already
+does them better.
+
+With Caddy that is the entire config:
+
+```
+admin.example.com, blog.example.com, friend.example.org {
+    reverse_proxy hostr:8080
+}
+```
+
+Set `HOSTR_TRUST_PROXY=true` so login throttling sees real client addresses
+rather than the proxy's.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HOSTR_ADDR` | `:8080` | listen address |
+| `HOSTR_DATA` | `/data` | blobs, manifests and the metadata file |
+| `HOSTR_ADMIN_DOMAIN` | *(unset)* | domain the control panel answers on. Unset means "any hostname not bound to a site" — convenient locally, sloppy in production |
+| `HOSTR_ADMIN_USER` | `admin` | first account, created on an empty store |
+| `HOSTR_ADMIN_PASSWORD` | *(generated)* | printed to the log once if unset |
+| `HOSTR_MAX_UPLOAD` | `104857600` | per-file upload ceiling, bytes |
+| `HOSTR_SECURE_COOKIES` | `true` | set `false` only for local HTTP |
+| `HOSTR_TRUST_PROXY` | `false` | read the client address from `X-Forwarded-For` |
+
+## Adding people
+
+The control panel's **Invites** tab (admin only) mints single-use codes. Hand
+one over; the recipient redeems it on the sign-in screen under *Use an invite*.
+No email, no SMTP, no OAuth app to register.
+
+Each account creates its own sites. A site owner can add collaborators, who may
+deploy to and read that site and nothing else.
+
+## hostrctl
+
+```sh
+go build -o hostrctl ./cmd/hostrctl        # or grab it out of the container
+
+hostrctl login   -server https://admin.example.com
+hostrctl create  -slug blog -domain blog.example.com
+hostrctl deploy  -site blog ./build
+hostrctl deploy  -site blog ./build -dry-run
+hostrctl status  -site blog
+hostrctl share   -site blog -user friend
+hostrctl sites
+```
+
+`login` exchanges your password for an API token and stores only the token
+(`~/.config/hostrctl/config.json`, mode 0600). `HOSTR_SERVER` and `HOSTR_TOKEN`
+override it, which is what you want in CI:
+
+```yaml
+- run: hostrctl deploy -site blog ./build
+  env:
+    HOSTR_SERVER: https://admin.example.com
+    HOSTR_TOKEN: ${{ secrets.HOSTR_TOKEN }}
+```
+
+Dot-files are skipped unless you pass `-hidden`. Symlinks are never followed.
+
+## How a deploy works
+
+1. `hostrctl` walks the directory and computes a SHA-256 per file.
+2. It asks the server which of those hashes it does not already have
+   (`POST /api/sites/{id}/check`).
+3. It uploads only the missing content
+   (`PUT /api/sites/{id}/blobs/{hash}`). The server re-hashes every byte it
+   receives and rejects anything that does not match the declared hash, so a
+   client cannot claim a blob it did not upload.
+4. It posts the complete path → hash manifest
+   (`POST /api/sites/{id}/deploy`). The swap is a single atomic rename.
+   Files absent from the new manifest stop being served immediately, and their
+   blobs are garbage collected.
+
+The manifest is the whole truth, which is why deletions need no separate call.
+Re-deploying an unchanged directory uploads nothing.
+
+## Security model
+
+- Blobs are namespaced **per site**, not globally deduplicated. A shared store
+  would let any tenant test whether a given file exists anywhere on the server
+  by uploading it and watching for a dedupe hit.
+- Every per-site route runs through one access gate, and a caller without
+  access gets `404` rather than `403` — site IDs cannot be enumerated.
+- Sites are served on their own hostnames, so the session cookie (scoped to the
+  admin domain, `HttpOnly`, `SameSite=Lax`) is never sent to tenant content, and
+  the API is unreachable from a site's origin.
+- Passwords: argon2id, 64 MiB, per-user salt. API tokens are stored as SHA-256
+  and shown exactly once. Changing a password invalidates every session.
+- Manifest paths are validated against traversal on write *and* the serving
+  layer can only reach blobs listed in that site's manifest, so a hostile path
+  has nothing to reach even if validation were bypassed.
+- Domains are globally unique; a tenant cannot claim a domain already bound to
+  someone else's site.
+- Cookie-authenticated state changes require a same-origin `Origin` header.
+  Token-authenticated calls skip that check — there is no ambient credential to
+  forge.
+- Admins are the server operator, who already has filesystem access to every
+  blob, so they can see and delete any site. That is stated rather than
+  pretended away.
+
+## Development
+
+```sh
+make          # frontend + both binaries into bin/
+make test
+make run      # plain HTTP on :8080, data in ./data, panel on any hostname
+```
+
+For frontend work, run `make run` in one terminal and `npm run dev` in
+`frontend/` in another — Vite proxies `/api` to the Go process.
+
+`go build` works without Node: `web/` ships a placeholder page that explains
+how to build the real console, and only that page is tracked in git.

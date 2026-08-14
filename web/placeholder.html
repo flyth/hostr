@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>hostr</title>
+    <style>
+      body { background:#0f0f10; color:#c9c7c4; font-family: system-ui, sans-serif;
+             display:grid; place-items:center; min-height:100vh; margin:0; }
+      div { max-width: 34rem; padding: 2rem; line-height: 1.6; }
+      code { background:#1c1c1e; padding:0.1rem 0.35rem; border-radius:0.25rem; }
+      a { color:#7dd3fc; }
+    </style>
+  </head>
+  <body>
+    <div>
+      <h1>Control panel not built</h1>
+      <p>
+        This <code>hostr</code> binary was compiled without the web console.
+        Run <code>make frontend</code> (needs Node), then rebuild.
+      </p>
+      <p>The HTTP API and static site serving are unaffected, so
+      <code>hostrctl</code> works as normal.</p>
+    </div>
+  </body>
+</html>
