@@ -30,21 +30,33 @@ import (
 	"golang.org/x/term"
 )
 
+// version is stamped by the release build with -X main.version.
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
 	}
 	cmds := map[string]func([]string) error{
-		"login":  cmdLogin,
-		"logout": cmdLogout,
-		"whoami": cmdWhoami,
-		"sites":  cmdSites,
-		"create": cmdCreate,
-		"deploy": cmdDeploy,
-		"status": cmdStatus,
-		"delete": cmdDelete,
-		"share":  cmdShare,
+		"login":    cmdLogin,
+		"logout":   cmdLogout,
+		"whoami":   cmdWhoami,
+		"sites":    cmdSites,
+		"create":   cmdCreate,
+		"deploy":   cmdDeploy,
+		"push":     cmdPush,
+		"ls":       cmdLs,
+		"rm":       cmdRm,
+		"settings": cmdSettings,
+		"token":    cmdToken,
+		"status":   cmdStatus,
+		"delete":   cmdDelete,
+		"share":    cmdShare,
+		"version": func([]string) error {
+			fmt.Println(version)
+			return nil
+		},
 	}
 	run, ok := cmds[os.Args[1]]
 	if !ok {
@@ -60,15 +72,24 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `hostrctl - deploy static sites to a hostr server
 
-  login   -server URL [-user NAME]   authenticate and store an API token
+  login    -server URL [-user NAME]  authenticate and store an API token
   logout                             forget the stored token
   whoami                             show the current account
   sites                              list sites you can deploy to
-  create  -slug S -domain D          create a new site
-  deploy  -site S [-dry-run] DIR     sync DIR to a site
-  status  -site S                    show a site's current deployment
-  share   -site S -user NAME [-remove]  manage collaborators
-  delete  -site S                    delete a site and all its files
+  create   -slug S -domain D         create a new site
+  deploy   -site S [-scope DIR] [-dry-run] DIR   sync DIR to a site or a scope
+  push     -site S [-scope DIR] [-as PATH] FILE...  upload files, delete nothing
+  ls       -site S [PATH]            list one directory of a site
+  rm       -site S [-r] PATH...      delete files or a whole directory
+  settings -site S [-listing] [-scope-only] [-auth-user U] [-no-auth]
+  token    -name N [-site S] [-scope DIR]...  mint an API token
+  status   -site S                   show a site's current deployment
+  share    -site S -user NAME [-remove]  manage collaborators
+  delete   -site S                   delete a site and all its files
+  version                            print the binary's version
+
+A scope is a directory on the site: "deploy -scope docs" replaces everything
+under /docs/ and leaves the rest of the site alone. "push" never deletes.
 
 Environment: HOSTR_SERVER and HOSTR_TOKEN override the stored config.
 `)
@@ -188,6 +209,14 @@ func (c *client) postJSON(p string, in, out any) error {
 	return c.do("POST", p, bytes.NewReader(b), "application/json", out)
 }
 
+func (c *client) patchJSON(p string, in, out any) error {
+	b, err := json.Marshal(in)
+	if err != nil {
+		return err
+	}
+	return c.do("PATCH", p, bytes.NewReader(b), "application/json", out)
+}
+
 // ---- commands ----
 
 func cmdLogin(args []string) error {
@@ -274,16 +303,19 @@ func cmdWhoami(args []string) error {
 }
 
 type site struct {
-	ID       string    `json:"id"`
-	Slug     string    `json:"slug"`
-	Domain   string    `json:"domain"`
-	Owner    string    `json:"owner"`
-	OwnerNam string    `json:"owner_name"`
-	Files    int       `json:"files"`
-	Bytes    int64     `json:"bytes"`
-	Version  int       `json:"version"`
-	Deployed time.Time `json:"deployed"`
-	Mine     bool      `json:"mine"`
+	ID         string    `json:"id"`
+	Slug       string    `json:"slug"`
+	Domain     string    `json:"domain"`
+	Owner      string    `json:"owner"`
+	OwnerNam   string    `json:"owner_name"`
+	Files      int       `json:"files"`
+	Bytes      int64     `json:"bytes"`
+	Version    int       `json:"version"`
+	Deployed   time.Time `json:"deployed"`
+	Mine       bool      `json:"mine"`
+	Listing    bool      `json:"listing"`
+	ScopedOnly bool      `json:"scoped_only"`
+	Protected  bool      `json:"protected"`
 }
 
 func cmdSites(args []string) error {
@@ -445,10 +477,12 @@ type manifest struct {
 func cmdDeploy(args []string) error {
 	fset := flag.NewFlagSet("deploy", flag.ExitOnError)
 	name := fset.String("site", "", "site slug, domain or id")
+	scopeFlag := fset.String("scope", "", "directory on the site to sync into; the rest is untouched")
 	dry := fset.Bool("dry-run", false, "show what would change, upload nothing")
 	hidden := fset.Bool("hidden", false, "include dot-files and dot-directories")
 	workers := fset.Int("j", 4, "parallel uploads")
 	_ = fset.Parse(args)
+	scope := strings.Trim(*scopeFlag, "/")
 
 	dir := fset.Arg(0)
 	if dir == "" {
@@ -476,7 +510,18 @@ func cmdDeploy(args []string) error {
 	if err := c.getJSON("/api/sites/"+s.ID+"/manifest", &remote); err != nil {
 		return err
 	}
-	added, changed, removed := diff(local, remote.Files)
+	// With a scope, only that subtree is being replaced, so it is the only
+	// part the diff — and in particular the delete count — may consider.
+	compare := remote.Files
+	if scope != "" {
+		compare = map[string]fileEntry{}
+		for p, e := range remote.Files {
+			if rest, ok := strings.CutPrefix(p, scope+"/"); ok {
+				compare[rest] = e
+			}
+		}
+	}
+	added, changed, removed := diff(local, compare)
 
 	// The server is the authority on what it already stores: ask it which
 	// content hashes are missing rather than guessing from the old manifest.
@@ -507,7 +552,11 @@ func cmdDeploy(args []string) error {
 	}
 	sort.Strings(upload)
 
-	fmt.Printf("%s -> %s\n", dir, s.Domain)
+	target := s.Domain
+	if scope != "" {
+		target += "/" + scope + "/"
+	}
+	fmt.Printf("%s -> %s\n", dir, target)
 	fmt.Printf("  %d files, %d new, %d changed, %d to delete\n", len(local), len(added), len(changed), len(removed))
 	fmt.Printf("  %d blobs to upload (%s), %d already on server\n",
 		len(upload), humanBytes(uploadBytes), len(local)-len(upload))
@@ -528,7 +577,7 @@ func cmdDeploy(args []string) error {
 		Bytes   int64 `json:"bytes"`
 		Removed int   `json:"removed"`
 	}
-	if err := c.postJSON("/api/sites/"+s.ID+"/deploy", map[string]any{"files": local}, &res); err != nil {
+	if err := c.postJSON("/api/sites/"+s.ID+"/deploy", map[string]any{"scope": scope, "files": local}, &res); err != nil {
 		return err
 	}
 	fmt.Printf("deployed v%d: %d files, %s live, %d stale blobs collected\n",

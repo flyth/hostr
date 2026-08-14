@@ -75,15 +75,24 @@ deploy to and read that site and nothing else.
 
 ## hostrctl
 
-```sh
-go build -o hostrctl ./cmd/hostrctl        # or grab it out of the container
+Every tagged release publishes a static binary for linux, macOS and Windows on
+both amd64 and arm64, under names that do not change between releases:
 
-hostrctl login   -server https://admin.example.com
-hostrctl create  -slug blog -domain blog.example.com
-hostrctl deploy  -site blog ./build
-hostrctl deploy  -site blog ./build -dry-run
-hostrctl status  -site blog
-hostrctl share   -site blog -user friend
+```sh
+curl -fsSL https://github.com/<owner>/<repo>/releases/latest/download/hostrctl_darwin_arm64 \
+  -o /usr/local/bin/hostrctl && chmod +x /usr/local/bin/hostrctl
+```
+
+Or build it: `go build -o hostrctl ./cmd/hostrctl`, or copy it out of the
+container.
+
+```sh
+hostrctl login    -server https://admin.example.com
+hostrctl create   -slug blog -domain blog.example.com
+hostrctl deploy   -site blog ./build
+hostrctl deploy   -site blog ./build -dry-run
+hostrctl status   -site blog
+hostrctl share    -site blog -user friend
 hostrctl sites
 ```
 
@@ -100,6 +109,111 @@ override it, which is what you want in CI:
 
 Dot-files are skipped unless you pass `-hidden`. Symlinks are never followed.
 
+## Scopes
+
+A scope is a directory on the site. `deploy -scope` syncs into it and leaves
+everything outside it alone, which is what turns one site into a shelf of
+independent projects rather than one thing you replace wholesale:
+
+```sh
+hostrctl deploy -site playground -scope my-website ./out
+#   ./out -> playground.example.com/my-website/
+```
+
+Sites can refuse unscoped writes entirely:
+
+```sh
+hostrctl settings -site playground -scope-only=true
+```
+
+Every write must then name a scope. No deploy replaces the whole site, no
+delete empties it, and nothing may write or remove a file at the top level.
+Deleting one named scope is itself a scoped write and stays allowed.
+
+Tokens can be limited two ways, which is the useful shape when the thing doing
+the uploading is an agent rather than a person:
+
+```sh
+hostrctl token -name deploy-bot -site playground                     # one site
+hostrctl token -name renderer   -site playground -scope my-website -scope drafts
+```
+
+A **site-bound** token is a full credential for that one site and nothing else
+— it cannot reach another site, and it cannot reach the account: no minting
+tokens, no password change, no creating sites.
+
+A **scoped** token is narrower still. It may be reused across every scope it
+was granted, and it can do nothing but move files inside them: not the rest of
+the site, not the site's settings, not its collaborators. It cannot list, read,
+or even confirm the existence of anything outside its scopes.
+
+## Single files
+
+`push` uploads without syncing anything. Nothing is deleted, and only content
+the server does not already have is sent:
+
+```sh
+hostrctl push -site playground -scope my-website render.png
+#   https://playground.example.com/my-website/render.png
+hostrctl push -site playground -as reports/august/index.html ./report.html
+```
+
+`ls` and `rm` work on what is already there:
+
+```sh
+hostrctl ls -site playground my-website
+hostrctl rm -site playground my-website/old.png
+hostrctl rm -site playground -r my-website/drafts
+```
+
+Deletion is immediate: the blobs behind those paths are collected as soon as
+the new manifest lands. `rm` resolves paths against the live manifest first, so
+a typo is an error rather than a version bump that removed nothing.
+
+The `skills/hostr-upload` directory holds a shareable skill that teaches an
+agent this workflow, including fetching the binary if it is missing.
+
+## Directory listing
+
+Off by default. Switched on, any directory without an `index.html` serves a
+two-pane file browser instead of a 404 — keyboard navigation, sizes, and inline
+preview of images, video, audio and text:
+
+```sh
+hostrctl settings -site playground -listing=true
+```
+
+It is the same browser the control panel uses, which is why it exists once, in
+`frontend/src/lib/browser.js`, embedded into the server for public listings and
+imported by the panel for the version with delete controls.
+
+Turning it on makes every path in the site enumerable. That is the entire point
+of the feature and also the entire risk of it: anything that was only protected
+by having an unguessable URL stops being protected.
+
+## Password protection
+
+A site can sit behind a basic auth prompt, pages and listings alike:
+
+```sh
+hostrctl settings -site playground -auth-user guest -auth-password 'something long'
+hostrctl settings -site playground -no-auth
+```
+
+The password is stored as argon2id like an account password. Verifying it costs
+64 MiB, so a successful check is memoised for an hour rather than repeated for
+every image on a page, and verifications are serialised so one page load cannot
+start forty of them at once. Changing or clearing the password invalidates the
+memo immediately.
+
+Only *failed* attempts are throttled, per site and per client address, and a
+credential that has already been verified skips the throttle entirely — behind
+a reverse proxy every visitor shares one address, and someone else's guessing
+must not sign them out.
+
+Basic auth sends the password on every request, base64-encoded and not
+encrypted. Only put it in front of a site that is served over HTTPS.
+
 ## How a deploy works
 
 1. `hostrctl` walks the directory and computes a SHA-256 per file.
@@ -114,8 +228,15 @@ Dot-files are skipped unless you pass `-hidden`. Symlinks are never followed.
    Files absent from the new manifest stop being served immediately, and their
    blobs are garbage collected.
 
-The manifest is the whole truth, which is why deletions need no separate call.
-Re-deploying an unchanged directory uploads nothing.
+Within a scope the manifest is the whole truth, which is why deletions need no
+separate call: a deploy replaces everything under its scope, and an unscoped
+deploy replaces the site. Re-deploying an unchanged directory uploads nothing.
+
+Single-file uploads and deletes go through `PATCH /api/sites/{id}/files`
+instead, which sets and removes exactly what it is given. Both paths
+read-modify-write the manifest under the same per-site lock, so two writers
+never merge onto a stale base, and both garbage collect only after the new
+manifest is safely in place.
 
 ## Security model
 
@@ -137,6 +258,25 @@ Re-deploying an unchanged directory uploads nothing.
 - Cookie-authenticated state changes require a same-origin `Origin` header.
   Token-authenticated calls skip that check — there is no ambient credential to
   forge.
+- Limited tokens are gated by a whitelist rather than a blacklist, at two
+  levels: a site-bound token cannot reach the account endpoints, and a scoped
+  token cannot reach anything but file content within its scopes. The endpoints
+  a limited token must not reach include the one that mints tokens, and a
+  credential able to issue itself an unrestricted replacement is not limited at
+  all.
+- Blob existence is not an oracle. `POST /check` answers a scoped token only
+  about content its own scopes already reference, so it cannot confirm that a
+  guessed document exists elsewhere in the site — at worst it re-uploads bytes
+  the server happens to have.
+- File sizes in a manifest come from the blob on disk, never from the client
+  that declared them.
+- The panel previews a site's files through the API rather than from the site's
+  own domain, so previews survive basic auth. Only images, video, audio and
+  plain text are served inline there; everything else downloads, and every
+  response carries `nosniff` and a sandbox CSP, because rendering a tenant's
+  HTML on the admin origin would put it next to the session cookie.
+- Site passwords are argon2id, verified once and then memoised for an hour
+  keyed on the stored hash, so changing one takes effect immediately.
 - Admins are the server operator, who already has filesystem access to every
   blob, so they can see and delete any site. That is stated rather than
   pretended away.

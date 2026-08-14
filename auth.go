@@ -171,10 +171,159 @@ func (t *throttle) allow(key string) bool {
 	return e.n <= t.limit
 }
 
+// blocked reports whether a key is already over its limit, without counting a
+// fresh attempt against it. Callers that only want to *charge* failures use
+// this plus fail, so a correct credential is never spent on someone else's
+// guessing.
+func (t *throttle) blocked(key string) bool {
+	now := time.Now()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	e, ok := t.m[key]
+	return ok && now.Before(e.until) && e.n >= t.limit
+}
+
+func (t *throttle) fail(key string) {
+	now := time.Now()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for k, e := range t.m {
+		if now.After(e.until) {
+			delete(t.m, k)
+		}
+	}
+	if e, ok := t.m[key]; ok {
+		e.n++
+		return
+	}
+	t.m[key] = &throttleEntry{n: 1, until: now.Add(t.window)}
+}
+
 func (t *throttle) reset(key string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.m, key)
+}
+
+// ---- site basic auth ----
+
+// ponytail: verified credentials are memoised for an hour rather than
+// re-hashed per request. Argon2id at 64 MiB is ~50 ms — fine once per visitor,
+// ruinous on a page with forty images. The key mixes in the stored hash, so
+// changing or clearing a site's password invalidates its entries with no
+// bookkeeping. Swap for a signed cookie if the memoisation window ever needs
+// to survive a restart.
+type authCache struct {
+	mu sync.Mutex
+	m  map[string]time.Time
+
+	// verify serialises the argon2 work itself. A page with forty images
+	// produces forty simultaneous requests carrying the same credentials, and
+	// without this every one of them would run its own 64 MiB hash before the
+	// first had a chance to fill the cache. Whoever wins re-checks the cache
+	// after waiting, so the rest cost nothing.
+	//
+	// ponytail: one lock for the whole server rather than one per credential.
+	// Verifications are ~50 ms and only happen on a cold cache, so the queue
+	// is short; make it per-key if a server ever hosts enough protected sites
+	// for that to matter.
+	verify sync.Mutex
+}
+
+const siteAuthTTL = time.Hour
+
+func newAuthCache() *authCache { return &authCache{m: map[string]time.Time{}} }
+
+func (c *authCache) key(siteID, storedHash, header string) string {
+	return sha256hex(siteID + "\x00" + storedHash + "\x00" + header)
+}
+
+func (c *authCache) ok(key string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	exp, ok := c.m[key]
+	if !ok {
+		return false
+	}
+	if time.Now().After(exp) {
+		delete(c.m, key)
+		return false
+	}
+	return true
+}
+
+func (c *authCache) put(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	for k, exp := range c.m {
+		if now.After(exp) {
+			delete(c.m, k)
+		}
+	}
+	// A hostile client can mint unlimited *failing* credentials, but only
+	// successful ones land here, so the map is bounded by real passwords in
+	// use. The cap is a backstop against a pathological number of sites.
+	if len(c.m) > 4096 {
+		clear(c.m)
+	}
+	c.m[key] = now.Add(siteAuthTTL)
+}
+
+// checkSiteAuth gates a tenant site behind its basic-auth credentials, if it
+// has any. It answers the request itself and returns false when the caller may
+// not proceed.
+func (s *Server) checkSiteAuth(w http.ResponseWriter, r *http.Request, site *Site) bool {
+	if site.AuthUser == "" || site.AuthHash == "" {
+		return true
+	}
+	deny := func(status int, msg string) bool {
+		// The realm is the site's own domain so a browser keeps one site's
+		// credentials separate from another's.
+		w.Header().Set("WWW-Authenticate", `Basic realm="`+site.Domain+`", charset="UTF-8"`)
+		w.Header().Set("Cache-Control", "no-store")
+		http.Error(w, msg, status)
+		return false
+	}
+
+	header := r.Header.Get("Authorization")
+	if header == "" {
+		return deny(http.StatusUnauthorized, "401 authentication required")
+	}
+	key := s.siteAuth.key(site.ID, site.AuthHash, header)
+	// A credential that has already been verified never touches the throttle,
+	// so a visitor who is signed in stays signed in while someone else is
+	// guessing — which matters because behind a reverse proxy every visitor
+	// may share one address.
+	if s.siteAuth.ok(key) {
+		return true
+	}
+
+	ip := s.clientIP(r)
+	tkey := "site:" + site.ID + ":" + ip
+	if s.siteThrottle.blocked(tkey) {
+		return deny(http.StatusTooManyRequests, "429 too many attempts, try again later")
+	}
+
+	s.siteAuth.verify.Lock()
+	defer s.siteAuth.verify.Unlock()
+	if s.siteAuth.ok(key) {
+		return true // another request verified the same credentials while we waited
+	}
+
+	user, pass, _ := r.BasicAuth()
+	// Both halves are checked every time, with no short-circuit: the username
+	// is half the secret here, and skipping the hash when it is wrong makes it
+	// recoverable by timing alone.
+	userOK := constantTimeEq(user, site.AuthUser)
+	passOK := verifyPassword(site.AuthHash, pass)
+	if !userOK || !passOK {
+		s.siteThrottle.fail(tkey)
+		return deny(http.StatusUnauthorized, "401 invalid credentials")
+	}
+	s.siteThrottle.reset(tkey)
+	s.siteAuth.put(key)
+	return true
 }
 
 // ---- request authentication ----
@@ -189,7 +338,10 @@ const (
 
 type caller struct {
 	user *User
-	kind authKind
+	// token is set only for bearer callers. It carries the site and scope
+	// limits the write handlers enforce; a cookie caller has none.
+	token *Token
+	kind  authKind
 }
 
 // authenticate resolves the caller from a bearer token or a session cookie, in
@@ -197,8 +349,8 @@ type caller struct {
 func (s *Server) authenticate(r *http.Request) caller {
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		secret := strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
-		if u := s.db.TokenUser(secret); u != nil {
-			return caller{user: u, kind: authToken}
+		if u, t := s.db.TokenUser(secret); u != nil {
+			return caller{user: u, token: t, kind: authToken}
 		}
 		return caller{}
 	}

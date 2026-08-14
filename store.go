@@ -32,6 +32,22 @@ type Site struct {
 	Owner   string    `json:"owner"`
 	Members []string  `json:"members"` // user IDs with deploy + read access
 	Created time.Time `json:"created"`
+
+	// Listing turns the directory browser on for URLs that have no index.html.
+	// Off by default: switching it on makes every path in the site
+	// enumerable, which is a real disclosure for anyone who was relying on a
+	// URL being unguessable.
+	Listing bool `json:"listing"`
+	// ScopedOnly refuses any write that is not confined to a scope: no
+	// whole-site deploy, no whole-site delete, and no writing or deleting a
+	// file at the top level. Deleting one named scope is still a scoped write
+	// and remains allowed.
+	ScopedOnly bool `json:"scoped_only"`
+
+	// Basic auth in front of the served site. AuthHash is argon2id like a user
+	// password and must never leave the server; siteView shadows it.
+	AuthUser string `json:"auth_user,omitempty"`
+	AuthHash string `json:"auth_hash,omitempty"`
 }
 
 type Token struct {
@@ -41,6 +57,13 @@ type Token struct {
 	Name     string    `json:"name"`
 	Created  time.Time `json:"created"`
 	LastUsed time.Time `json:"last_used,omitzero"`
+
+	// Site restricts the token to one site, Scopes to a set of path prefixes
+	// within it. Both empty means the token can do whatever its user can. A
+	// token with scopes may be reused across all of them, but cannot write
+	// outside them and cannot write the site root.
+	Site   string   `json:"site,omitempty"`
+	Scopes []string `json:"scopes,omitempty"`
 }
 
 // Invite codes are stored in the clear, unlike tokens. They are single-use,
@@ -280,17 +303,31 @@ func (db *DB) Redeem(code, name, password string) (*User, error) {
 
 // ---- tokens ----
 
-func (db *DB) CreateToken(user, name string) (*Token, string, error) {
+func (db *DB) CreateToken(user, name, site string, scopes []string) (*Token, string, error) {
+	for _, sc := range scopes {
+		if _, ok := cleanPath(sc); !ok {
+			return nil, "", errors.New("illegal scope: " + sc)
+		}
+	}
 	secret := "hst_" + randHex(24)
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	t := &Token{ID: randHex(8), Hash: sha256hex(secret), User: user, Name: name, Created: time.Now().UTC()}
+	if site != "" {
+		if _, ok := db.d.Sites[site]; !ok {
+			return nil, "", errNotFound
+		}
+	}
+	t := &Token{
+		ID: randHex(8), Hash: sha256hex(secret), User: user, Name: name,
+		Created: time.Now().UTC(), Site: site, Scopes: scopes,
+	}
 	db.d.Tokens[t.ID] = t
-	c := *t
-	return &c, secret, db.save()
+	return t.clone(), secret, db.save()
 }
 
-func (db *DB) TokenUser(secret string) *User {
+// TokenUser resolves a bearer secret to its owner and the token itself; the
+// token carries the site and scope limits the API has to enforce.
+func (db *DB) TokenUser(secret string) (*User, *Token) {
 	h := sha256hex(secret)
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -298,7 +335,7 @@ func (db *DB) TokenUser(secret string) *User {
 		if constantTimeEq(t.Hash, h) {
 			u, ok := db.d.Users[t.User]
 			if !ok {
-				return nil
+				return nil, nil
 			}
 			// Last-used is a coarse "is this token still in use" signal, so it
 			// is only flushed once a minute. A deploy fires hundreds of
@@ -309,10 +346,10 @@ func (db *DB) TokenUser(secret string) *User {
 				_ = db.save()
 			}
 			c := *u
-			return &c
+			return &c, t.clone()
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 func (db *DB) Tokens(user string) []*Token {
@@ -321,9 +358,9 @@ func (db *DB) Tokens(user string) []*Token {
 	out := []*Token{}
 	for _, t := range db.d.Tokens {
 		if t.User == user {
-			c := *t
+			c := t.clone()
 			c.Hash = ""
-			out = append(out, &c)
+			out = append(out, c)
 		}
 	}
 	return out
@@ -480,6 +517,83 @@ func (db *DB) DeleteSite(id string) error {
 	return db.save()
 }
 
+// SetSiteSettings applies whichever flags the caller actually sent; a nil
+// pointer leaves that flag alone.
+func (db *DB) SetSiteSettings(id string, listing, scopedOnly *bool) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	s, ok := db.d.Sites[id]
+	if !ok {
+		return errNotFound
+	}
+	if listing != nil {
+		s.Listing = *listing
+	}
+	if scopedOnly != nil {
+		s.ScopedOnly = *scopedOnly
+	}
+	return db.save()
+}
+
+// checkSiteCredentials validates a basic-auth pair without doing the expensive
+// part, so a caller can reject a bad request before committing anything else.
+func checkSiteCredentials(user, password string) error {
+	// A colon can never survive the round trip: basic auth joins the two
+	// halves with one and the client splits on the first, so such a username
+	// would leave the site permanently unopenable.
+	if strings.ContainsAny(user, ":\x00") {
+		return errors.New("site username cannot contain a colon")
+	}
+	if len(password) < 8 {
+		return errors.New("site password must be at least 8 characters")
+	}
+	return nil
+}
+
+// CheckDomain reports whether a domain is well formed and unclaimed, changing
+// nothing.
+func (db *DB) CheckDomain(id, domain string) error {
+	domain = normDomain(domain)
+	if !domainRe.MatchString(domain) || len(domain) > 253 {
+		return errors.New("invalid domain")
+	}
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if _, ok := db.d.Sites[id]; !ok {
+		return errNotFound
+	}
+	for _, o := range db.d.Sites {
+		if o.ID != id && o.Domain == domain {
+			return errConflict
+		}
+	}
+	return nil
+}
+
+// SetSiteAuth sets or clears the basic-auth credentials in front of a site. An
+// empty user removes protection; anything else needs both halves.
+func (db *DB) SetSiteAuth(id, user, password string) error {
+	user = strings.TrimSpace(user)
+	hash := ""
+	if user != "" {
+		if err := checkSiteCredentials(user, password); err != nil {
+			return err
+		}
+		var err error
+		if hash, err = hashPassword(password); err != nil {
+			return err
+		}
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	s, ok := db.d.Sites[id]
+	if !ok {
+		return errNotFound
+	}
+	s.AuthUser, s.AuthHash = user, hash
+	return db.save()
+}
+
 func (u *User) clone() *User {
 	c := *u
 	return &c
@@ -489,6 +603,61 @@ func (s *Site) clone() *Site {
 	c := *s
 	c.Members = append([]string(nil), s.Members...)
 	return &c
+}
+
+func (t *Token) clone() *Token {
+	c := *t
+	c.Scopes = append([]string(nil), t.Scopes...)
+	return &c
+}
+
+// allowsSite reports whether a site-bound token may touch this site.
+func (t *Token) allowsSite(id string) bool {
+	return t == nil || t.Site == "" || t.Site == id
+}
+
+// restricted reports whether the token is limited to one site, with or without
+// scopes. Such a token must not reach the account-level endpoints — above all
+// the one that mints tokens, since a restricted token able to issue an
+// unrestricted one is not restricted at all.
+func (t *Token) restricted() bool {
+	return t != nil && (t.Site != "" || len(t.Scopes) > 0)
+}
+
+// allowsScope reports whether the token may write the directory `scope`, where
+// "" is the site root. A token with scopes is confined to them and to anything
+// nested inside them, which is what stops a scoped agent from replacing a
+// sibling project or emptying the site.
+func (t *Token) allowsScope(scope string) bool {
+	if t == nil || len(t.Scopes) == 0 {
+		return true
+	}
+	if scope == "" {
+		return false
+	}
+	for _, s := range t.Scopes {
+		if scope == s || strings.HasPrefix(scope, s+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// allowsFile is allowsScope for an individual file, and is deliberately
+// stricter: a file whose path *equals* the scope is not inside it, it sits
+// beside it at the parent level. Serving resolves a bare path before a
+// directory index, so allowing that would let a token scoped to `docs` write a
+// root-level file that shadows every URL under `docs/`.
+func (t *Token) allowsFile(p string) bool {
+	if t == nil || len(t.Scopes) == 0 {
+		return true
+	}
+	for _, s := range t.Scopes {
+		if strings.HasPrefix(p, s+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // allows reports whether u may read and deploy this site. Admins are the
