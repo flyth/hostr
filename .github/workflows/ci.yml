@@ -103,7 +103,7 @@ jobs:
       # actually be run. `FROM scratch` plus a non-root user is the kind of
       # thing that only fails at runtime, and it should fail on the PR.
       - name: Build for smoke test
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
@@ -130,7 +130,7 @@ jobs:
           echo "container never became ready:"; docker logs hostr-smoke; exit 1
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           # The Dockerfile cross-compiles from the build platform, so the second
