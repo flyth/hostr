@@ -1,0 +1,79 @@
+version: 2
+updates:
+  # The Go module is deliberately thin (x/crypto, x/term), so most weeks this
+  # will be quiet. When it does fire it is usually a security fix.
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - go
+    groups:
+      # Bundle minor + patch bumps into one PR per week to reduce noise.
+      # Major bumps still open individual PRs so they get scrutiny.
+      go-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: npm
+    directory: "/frontend"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - frontend
+    groups:
+      # SvelteKit, Vite and the Svelte compiler move together; splitting them
+      # across PRs produces builds that cannot pass CI on their own.
+      svelte:
+        patterns:
+          - "svelte"
+          - "svelte-check"
+          - "@sveltejs/*"
+          - "vite"
+          - "@tailwindcss/*"
+          - "tailwindcss"
+      npm-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Keeps the node/golang builder tags and any future runtime base current.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - docker
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      actions-minor-patch:
+        update-types:
+          - minor
+          - patch
