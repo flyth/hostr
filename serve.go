@@ -20,15 +20,31 @@ func (s *Server) serveSite(w http.ResponseWriter, r *http.Request, site *Site) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	// Before anything is disclosed, including whether a path exists.
+	if !s.checkSiteAuth(w, r, site) {
+		return
+	}
 
 	m := s.storage.Manifest(site.ID)
 	req := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
+
+	// The browser page fetches its rows from the same URL. A query parameter
+	// rather than a reserved path prefix, so no filename in a site can ever
+	// collide with it.
+	if r.URL.Query().Get("_hostr") == "ls" {
+		s.serveListingJSON(w, site, m, req)
+		return
+	}
 
 	// A directory-ish URL without its trailing slash gets a redirect rather
 	// than a body, so relative links inside the page resolve correctly.
 	if req != "" && !strings.HasSuffix(r.URL.Path, "/") {
 		if _, direct := m.Files[req]; !direct {
-			if _, isDir := m.Files[req+"/index.html"]; isDir {
+			_, isDir := m.Files[req+"/index.html"]
+			if !isDir && site.Listing {
+				isDir = m.HasDir(req)
+			}
+			if isDir {
 				u := *r.URL
 				u.Path = "/" + req + "/"
 				http.Redirect(w, r, u.RequestURI(), http.StatusMovedPermanently)
@@ -37,12 +53,48 @@ func (s *Server) serveSite(w http.ResponseWriter, r *http.Request, site *Site) {
 		}
 	}
 
-	name, entry, ok := resolve(m, req)
-	if !ok {
-		s.serveNotFound(w, r, site, m)
+	if name, entry, ok := resolve(m, req); ok {
+		s.writeBlob(w, r, site, name, entry, http.StatusOK)
 		return
 	}
-	s.writeBlob(w, r, site, name, entry, http.StatusOK)
+	// A real directory with no index of its own. Only once the site has opted
+	// in — listing turns every path into something a stranger can enumerate.
+	if site.Listing && m.HasDir(req) {
+		s.serveListingPage(w, r, site, req)
+		return
+	}
+	s.serveNotFound(w, r, site, m)
+}
+
+// serveListingJSON feeds the browser page. It is the same disclosure as the
+// page itself, so it is gated on the same flag.
+func (s *Server) serveListingJSON(w http.ResponseWriter, site *Site, m *Manifest, dir string) {
+	if !site.Listing {
+		http.Error(w, "404 not found", http.StatusNotFound)
+		return
+	}
+	entries, found := m.List(dir)
+	if !found {
+		http.Error(w, "404 not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	writeJSON(w, http.StatusOK, map[string]any{"path": dir, "entries": entries})
+}
+
+func (s *Server) serveListingPage(w http.ResponseWriter, r *http.Request, site *Site, dir string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
+	// No path or filename is interpolated into markup — the shell is static
+	// and every name arrives later as JSON, so there is nothing here for a
+	// hostile filename to break out of.
+	_, _ = w.Write(listingPage(dir, site.Domain))
 }
 
 // resolve maps a request path onto a manifest entry, trying the file itself,

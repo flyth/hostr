@@ -29,13 +29,15 @@ func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 		t.Fatal(err)
 	}
 	s := &Server{
-		cfg:      Config{Data: dir, AdminDomain: "admin.test", MaxUpload: 1 << 20},
-		db:       db,
-		storage:  newStorage(dir),
-		sessions: newSessions(),
-		throttle: newThrottle(100, time.Minute),
-		log:      log.New(io.Discard, "", 0),
-		spa:      os.DirFS(dir), // no SPA in tests
+		cfg:          Config{Data: dir, AdminDomain: "admin.test", MaxUpload: 1 << 20},
+		db:           db,
+		storage:      newStorage(dir),
+		sessions:     newSessions(),
+		throttle:     newThrottle(100, time.Minute),
+		siteThrottle: newThrottle(100, time.Minute),
+		siteAuth:     newAuthCache(),
+		log:          log.New(io.Discard, "", 0),
+		spa:          os.DirFS(dir), // no SPA in tests
 	}
 	s.api = s.routes()
 	ts := httptest.NewServer(s)
@@ -47,6 +49,7 @@ type api struct {
 	t     *testing.T
 	base  string
 	token string
+	user  string // the account behind the token, for tests that mint their own
 }
 
 func (a *api) call(method, path string, body any, out any) int {
@@ -97,11 +100,11 @@ func tenant(t *testing.T, s *Server, ts *httptest.Server, name string) *api {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, secret, err := s.db.CreateToken(u.ID, "test")
+	_, secret, err := s.db.CreateToken(u.ID, "test", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &api{t: t, base: ts.URL, token: secret}
+	return &api{t: t, base: ts.URL, token: secret, user: u.ID}
 }
 
 func TestDeployServeAndIsolation(t *testing.T) {
@@ -291,11 +294,11 @@ func TestConcurrentDeploysKeepManifestConsistent(t *testing.T) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			st.Deploy(site, map[string]FileEntry{"a.html": small}) //nolint:errcheck // losing the race is a valid outcome
+			st.Deploy(site, "", map[string]FileEntry{"a.html": small}) //nolint:errcheck // losing the race is a valid outcome
 		}()
 		go func() {
 			defer wg.Done()
-			st.Deploy(site, big) //nolint:errcheck // as above
+			st.Deploy(site, "", big) //nolint:errcheck // as above
 		}()
 		wg.Wait()
 

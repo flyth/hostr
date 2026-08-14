@@ -49,6 +49,11 @@ export type Site = {
   deployed?: string;
   mine: boolean;
   created: string;
+  listing: boolean;
+  scoped_only: boolean;
+  /** Whether basic auth is set. The username never leaves the server — it is
+   *  half of that credential. */
+  protected: boolean;
 };
 
 export type Token = {
@@ -56,7 +61,19 @@ export type Token = {
   name: string;
   created: string;
   last_used?: string;
+  site?: string;
+  scopes?: string[];
 };
+
+export type DirEntry = {
+  name: string;
+  dir?: boolean;
+  size: number;
+  files?: number;
+  hash?: string;
+};
+
+export type Listing = { path: string; entries: DirEntry[] };
 
 export type Invite = {
   code: string;

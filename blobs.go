@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -194,14 +195,69 @@ func (st *Storage) readManifest(siteID string) *Manifest {
 	return &m
 }
 
-// Deploy replaces a site's file set wholesale. Every referenced blob must
-// already be uploaded; anything the new manifest drops is garbage collected,
-// which is how deletions propagate.
-func (st *Storage) Deploy(siteID string, files map[string]FileEntry) (*Manifest, int, error) {
+// scopePrefix turns a scope into the path prefix its files live under. The
+// empty scope is the site root and yields an empty prefix, which every
+// HasPrefix test below then matches — that is exactly the whole-site
+// behaviour deploy has always had.
+func scopePrefix(scope string) (string, bool) {
+	if scope == "" {
+		return "", true
+	}
+	sc, ok := cleanPath(scope)
+	if !ok {
+		return "", false
+	}
+	return sc + "/", true
+}
+
+// Deploy replaces a site's file set, or — with a scope — just the subtree under
+// it, leaving everything else untouched. Every referenced blob must already be
+// uploaded; anything the new manifest drops is garbage collected, which is how
+// deletions propagate. Paths in `files` are relative to the scope.
+func (st *Storage) Deploy(siteID, scope string, files map[string]FileEntry) (*Manifest, int, error) {
+	prefix, ok := scopePrefix(scope)
+	if !ok {
+		return nil, 0, errors.New("illegal scope: " + scope)
+	}
 	// Path and hash shapes are pure checks, so do them before queueing on the
 	// lock — a malformed request should not wait behind someone else's deploy.
+	// Cleaning the *joined* path is what stops `../` in a scoped upload from
+	// landing outside its subtree.
 	clean := make(map[string]FileEntry, len(files))
 	for p, e := range files {
+		cp, ok := cleanPath(prefix + p)
+		if !ok || !strings.HasPrefix(cp, prefix) {
+			return nil, 0, errors.New("illegal path: " + p)
+		}
+		if !validHash(e.Hash) {
+			return nil, 0, errBadHash
+		}
+		clean[cp] = e
+	}
+	return st.commit(siteID, func(cur map[string]FileEntry) error {
+		for p := range cur {
+			if strings.HasPrefix(p, prefix) {
+				delete(cur, p)
+			}
+		}
+		// A file whose path is exactly the scope name is not under the prefix,
+		// but serving resolves a bare path before a directory index, so
+		// leaving it behind would let it shadow every URL in the scope this
+		// deploy just published.
+		delete(cur, scope)
+		for p, e := range clean {
+			cur[p] = e
+		}
+		return nil
+	})
+}
+
+// Patch adds or replaces the listed files and deletes the listed paths, and
+// touches nothing else. A delete entry ending in "/" removes that whole
+// subtree; "/" on its own is every file in the site.
+func (st *Storage) Patch(siteID string, set map[string]FileEntry, del []string) (*Manifest, int, error) {
+	clean := make(map[string]FileEntry, len(set))
+	for p, e := range set {
 		cp, ok := cleanPath(p)
 		if !ok {
 			return nil, 0, errors.New("illegal path: " + p)
@@ -211,19 +267,53 @@ func (st *Storage) Deploy(siteID string, files map[string]FileEntry) (*Manifest,
 		}
 		clean[cp] = e
 	}
+	prefixes := make([]string, 0, len(del))
+	exact := make([]string, 0, len(del))
+	for _, d := range del {
+		if d == "/" {
+			prefixes = append(prefixes, "")
+			continue
+		}
+		if strings.HasSuffix(d, "/") {
+			cp, ok := cleanPath(strings.TrimSuffix(d, "/"))
+			if !ok {
+				return nil, 0, errors.New("illegal path: " + d)
+			}
+			prefixes = append(prefixes, cp+"/")
+			continue
+		}
+		cp, ok := cleanPath(d)
+		if !ok {
+			return nil, 0, errors.New("illegal path: " + d)
+		}
+		exact = append(exact, cp)
+	}
+	return st.commit(siteID, func(cur map[string]FileEntry) error {
+		for _, p := range exact {
+			delete(cur, p)
+		}
+		for _, pre := range prefixes {
+			for p := range cur {
+				if strings.HasPrefix(p, pre) {
+					delete(cur, p)
+				}
+			}
+		}
+		for p, e := range clean {
+			cur[p] = e
+		}
+		return nil
+	})
+}
 
+// commit applies mutate to a copy of the live file set and publishes the
+// result as the next version. Read-modify-write has to happen inside the site
+// lock or two concurrent scoped deploys would each merge onto a stale base and
+// the later one would silently drop the earlier one's files.
+func (st *Storage) commit(siteID string, mutate func(map[string]FileEntry) error) (*Manifest, int, error) {
 	lk := st.siteLock(siteID)
 	lk.Lock()
 	defer lk.Unlock()
-
-	// Blob presence is checked *inside* the lock. A deploy that raced with
-	// another one and lost its uploads fails here rather than publishing a
-	// manifest that points at collected files.
-	for p, e := range clean {
-		if !st.HasBlob(siteID, e.Hash) {
-			return nil, 0, errors.New("missing uploaded content for " + p + "; re-run the deploy")
-		}
-	}
 
 	st.mu.RLock()
 	prev := st.cache[siteID]
@@ -231,7 +321,45 @@ func (st *Storage) Deploy(siteID string, files map[string]FileEntry) (*Manifest,
 	if prev == nil {
 		prev = st.readManifest(siteID)
 	}
-	m := &Manifest{Version: prev.Version + 1, Updated: time.Now().UTC(), Files: clean}
+
+	next := make(map[string]FileEntry, len(prev.Files))
+	for p, e := range prev.Files {
+		next[p] = e
+	}
+	if err := mutate(next); err != nil {
+		return nil, 0, err
+	}
+
+	// Blob presence is checked *inside* the lock. A deploy that raced with
+	// another one and lost its uploads fails here rather than publishing a
+	// manifest that points at collected files. Entries carried over unchanged
+	// were live a moment ago and cannot have been collected under this lock,
+	// so only the new ones need a stat.
+	changed := false
+	for p, e := range next {
+		if pe, ok := prev.Files[p]; ok && pe.Hash == e.Hash {
+			continue
+		}
+		changed = true
+		info, err := os.Stat(st.blobPath(siteID, e.Hash))
+		if err != nil || !validHash(e.Hash) {
+			return nil, 0, errors.New("missing uploaded content for " + p + "; re-run the deploy")
+		}
+		// The size comes from disk, never from the client. A declared size is
+		// only ever used for display and quota arithmetic, and taking it on
+		// trust let a caller report a negative total or a one-byte file that
+		// is really two hundred megabytes.
+		e.Size = info.Size()
+		next[p] = e
+	}
+	if !changed && len(next) == len(prev.Files) {
+		// Nothing actually moved: no new version, no rewrite, no sweep. A
+		// no-op push or a delete that matched nothing should not churn the
+		// manifest or make the site look freshly deployed.
+		return prev, 0, nil
+	}
+
+	m := &Manifest{Version: prev.Version + 1, Updated: time.Now().UTC(), Files: next}
 
 	if err := os.MkdirAll(st.siteDir(siteID), 0o700); err != nil {
 		return nil, 0, err
@@ -254,14 +382,41 @@ func (st *Storage) Deploy(siteID string, files map[string]FileEntry) (*Manifest,
 	// GC runs after the manifest swap: a crash mid-sweep leaves orphan blobs
 	// (harmless, retried next deploy) rather than a manifest pointing at a
 	// file that is already gone.
-	return m, st.gc(siteID, m), nil
+	return m, st.gc(siteID, m, prev), nil
 }
 
-func (st *Storage) gc(siteID string, m *Manifest) int {
+// gcGrace protects blobs no manifest has ever referenced: content that has
+// been uploaded for a deploy which has not landed yet. Collecting those breaks
+// every other writer on the site — one agent's deploy would sweep away a
+// second agent's staged uploads, and the second agent's deploy would then fail
+// its own presence check, forever.
+const gcGrace = time.Hour
+
+// gc removes a site's unreferenced blobs. prev is the manifest being replaced:
+// anything it referenced and the new one does not is unambiguously garbage and
+// goes immediately, while a blob neither version knows about is either a
+// staged upload or the remains of an abandoned one, and only the second is
+// safe to touch.
+func (st *Storage) gc(siteID string, m, prev *Manifest) int {
 	live := make(map[string]bool, len(m.Files))
 	for _, e := range m.Files {
 		live[e.Hash] = true
 	}
+	orphaned := map[string]bool{}
+	for _, e := range prev.Files {
+		if !live[e.Hash] {
+			orphaned[e.Hash] = true
+		}
+	}
+	// ponytail: nothing became garbage, so skip the walk entirely rather than
+	// scan the whole blob tree on every single-file push. Abandoned uploads
+	// wait for the next commit that does orphan something; they are bounded by
+	// the upload limit and invisible to the site either way.
+	if len(orphaned) == 0 {
+		return 0
+	}
+
+	cutoff := time.Now().Add(-gcGrace)
 	blobs := filepath.Join(st.siteDir(siteID), "blobs")
 	removed := 0
 	_ = filepath.WalkDir(blobs, func(p string, d os.DirEntry, err error) error {
@@ -271,14 +426,89 @@ func (st *Storage) gc(siteID string, m *Manifest) int {
 		if strings.HasPrefix(d.Name(), ".upload-") {
 			return nil // an upload in flight, not an orphan
 		}
-		if !live[d.Name()] {
-			if os.Remove(p) == nil {
-				removed++
+		if live[d.Name()] {
+			return nil
+		}
+		if !orphaned[d.Name()] {
+			info, err := d.Info()
+			if err != nil || info.ModTime().After(cutoff) {
+				return nil //nolint:nilerr // staged for a deploy that has not happened yet
 			}
+		}
+		if os.Remove(p) == nil {
+			removed++
 		}
 		return nil
 	})
 	return removed
+}
+
+// Entry is one row of a directory listing: a file, or a directory summarised
+// by what it holds.
+type Entry struct {
+	Name  string `json:"name"`
+	Dir   bool   `json:"dir,omitempty"`
+	Size  int64  `json:"size"`
+	Files int    `json:"files,omitempty"` // directories only
+	Hash  string `json:"hash,omitempty"`  // files only
+}
+
+// List returns the immediate children of a directory, directories first and
+// each group by name. The manifest is a flat path map, so a listing is a
+// prefix scan plus a split on the next separator — no tree to keep in sync.
+// The bool reports whether the directory exists at all.
+func (m *Manifest) List(dir string) ([]Entry, bool) {
+	prefix := ""
+	if dir != "" {
+		prefix = dir + "/"
+	}
+	dirs := map[string]*Entry{}
+	files := []Entry{}
+	// The root always exists, even on a site with nothing in it yet —
+	// otherwise a fresh site's browser opens on an error instead of an empty
+	// folder.
+	found := dir == ""
+	for p, e := range m.Files {
+		if !strings.HasPrefix(p, prefix) {
+			continue
+		}
+		found = true
+		rest := p[len(prefix):]
+		if i := strings.IndexByte(rest, '/'); i >= 0 {
+			d, ok := dirs[rest[:i]]
+			if !ok {
+				d = &Entry{Name: rest[:i], Dir: true}
+				dirs[rest[:i]] = d
+			}
+			d.Size += e.Size
+			d.Files++
+			continue
+		}
+		files = append(files, Entry{Name: rest, Size: e.Size, Hash: e.Hash})
+	}
+	out := make([]Entry, 0, len(dirs)+len(files))
+	for _, d := range dirs {
+		out = append(out, *d)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	sort.Slice(files, func(i, j int) bool { return files[i].Name < files[j].Name })
+	return append(out, files...), found
+}
+
+// HasDir reports whether any file lives under a directory, without building
+// the listing. Serving asks this on every miss, so it stops at the first hit
+// rather than walking a manifest that may hold a hundred thousand paths.
+func (m *Manifest) HasDir(dir string) bool {
+	if dir == "" {
+		return true
+	}
+	prefix := dir + "/"
+	for p := range m.Files {
+		if strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // Usage reports the on-disk byte total of a site's live files.

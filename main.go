@@ -39,9 +39,14 @@ type Server struct {
 	storage  *Storage
 	sessions *sessions
 	throttle *throttle
-	log      *log.Logger
-	api      http.Handler
-	spa      fs.FS
+	// siteThrottle counts failed basic-auth attempts per site and client
+	// address. It is separate from the login throttle: that one guards one
+	// account, this one guards a whole site's audience.
+	siteThrottle *throttle
+	siteAuth     *authCache
+	log          *log.Logger
+	api          http.Handler
+	spa          fs.FS
 }
 
 func main() {
@@ -69,13 +74,15 @@ func main() {
 	}
 
 	s := &Server{
-		cfg:      cfg,
-		db:       db,
-		storage:  newStorage(cfg.Data),
-		sessions: newSessions(),
-		throttle: newThrottle(10, 15*time.Minute),
-		log:      logger,
-		spa:      spa,
+		cfg:          cfg,
+		db:           db,
+		storage:      newStorage(cfg.Data),
+		sessions:     newSessions(),
+		throttle:     newThrottle(10, 15*time.Minute),
+		siteThrottle: newThrottle(30, 5*time.Minute),
+		siteAuth:     newAuthCache(),
+		log:          logger,
+		spa:          spa,
 	}
 	s.api = s.routes()
 
