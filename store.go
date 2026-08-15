@@ -43,6 +43,12 @@ type Site struct {
 	// it; nobody can walk the whole site starting from `/`. Only meaningful
 	// while Listing is on.
 	ListingNoRoot bool `json:"listing_no_root"`
+	// Markdown renders `.md` files as documents instead of handing over the
+	// source. It is opt-in because it changes what a markdown file can do: a
+	// rendered document runs whatever HTML and script the markdown contains, on
+	// the site's own origin, which is the same trust a deployed `.html` file
+	// already has but not the trust a `.md` file had a moment ago.
+	Markdown bool `json:"markdown"`
 	// ScopedOnly refuses any write that is not confined to a scope: no
 	// whole-site deploy, no whole-site delete, and no writing or deleting a
 	// file at the top level. Deleting one named scope is still a scoped write
@@ -529,11 +535,12 @@ func (db *DB) DeleteSite(id string) error {
 type siteSettings struct {
 	Listing       *bool
 	ListingNoRoot *bool
+	Markdown      *bool
 	ScopedOnly    *bool
 }
 
 func (set siteSettings) empty() bool {
-	return set.Listing == nil && set.ListingNoRoot == nil && set.ScopedOnly == nil
+	return set.Listing == nil && set.ListingNoRoot == nil && set.Markdown == nil && set.ScopedOnly == nil
 }
 
 // SetSiteSettings applies whichever flags the caller actually sent.
@@ -549,6 +556,9 @@ func (db *DB) SetSiteSettings(id string, set siteSettings) error {
 	}
 	if set.ListingNoRoot != nil {
 		s.ListingNoRoot = *set.ListingNoRoot
+	}
+	if set.Markdown != nil {
+		s.Markdown = *set.Markdown
 	}
 	if set.ScopedOnly != nil {
 		s.ScopedOnly = *set.ScopedOnly

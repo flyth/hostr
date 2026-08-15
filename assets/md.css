@@ -1,0 +1,430 @@
+/* Typography for rendered markdown. Served from /_hostr/ and used twice: as
+   the stylesheet of a standalone .md page, and inside the sandboxed preview
+   frame of the file browser. Nothing here may assume a surrounding stylesheet.
+
+   Newsreader sets the text, Archivo the headings and the small mechanical
+   parts, Fira Code the code. The three families are the only things worth
+   changing at the top of this file — everything below is sized off them. */
+
+@font-face {
+  font-family: 'Archivo';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url(fonts/archivo-latin-ext.woff2) format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: 'Archivo';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url(fonts/archivo-latin.woff2) format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: 'Fira Code';
+  font-style: normal;
+  font-weight: 300 700;
+  font-display: swap;
+  src: url(fonts/fira-code-latin-ext.woff2) format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: 'Fira Code';
+  font-style: normal;
+  font-weight: 300 700;
+  font-display: swap;
+  src: url(fonts/fira-code-latin.woff2) format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: 'Newsreader';
+  font-style: italic;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url(fonts/newsreader-italic-latin-ext.woff2) format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: 'Newsreader';
+  font-style: italic;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url(fonts/newsreader-italic-latin.woff2) format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: 'Newsreader';
+  font-style: normal;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url(fonts/newsreader-latin-ext.woff2) format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: 'Newsreader';
+  font-style: normal;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url(fonts/newsreader-latin.woff2) format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+:root {
+  --md-text: 'Newsreader', ui-serif, Georgia, serif;
+  --md-display: 'Archivo', ui-sans-serif, system-ui, sans-serif;
+  --md-code: 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --md-bg: #fdfcfa;
+  --md-fg: #1c1b19;
+  --md-mute: #6d6a63;
+  --md-rule: #e4e0d8;
+  --md-panel: #f5f2ec;
+  --md-accent: #1a5c9e;
+  --md-mark: #fdf0b8;
+
+  /* Roughly 68 characters at the body size, which is where long-form prose
+     stops being comfortable to track back across. */
+  --md-measure: 42rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --md-bg: #131417;
+    --md-fg: #e7e5e0;
+    --md-mute: #97948c;
+    --md-rule: #2a2c31;
+    --md-panel: #1a1c20;
+    --md-accent: #8cb6f0;
+    --md-mark: #4a4225;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--md-bg);
+  color: var(--md-fg);
+  font-family: var(--md-text);
+  font-optical-sizing: auto;
+  font-size: clamp(1.0625rem, 1rem + 0.25vw, 1.1875rem);
+  line-height: 1.7;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+.md {
+  max-width: var(--md-measure);
+  margin: 0 auto;
+  padding: clamp(2rem, 5vw, 5rem) clamp(1.25rem, 5vw, 2rem) 6rem;
+  overflow-wrap: break-word;
+}
+
+/* Hidden until the document has been rendered, so nothing flashes half-built. */
+.md[hidden] {
+  display: none;
+}
+
+/* ---- headings ---- */
+
+.md h1,
+.md h2,
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+  font-family: var(--md-display);
+  font-weight: 650;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  margin: 2.5em 0 0.6em;
+  scroll-margin-top: 2rem;
+}
+
+.md > :first-child {
+  margin-top: 0;
+}
+
+.md h1 {
+  font-size: clamp(2.1rem, 1.5rem + 2.6vw, 3rem);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  margin-bottom: 0.4em;
+}
+
+.md h2 {
+  font-size: 1.75em;
+  padding-bottom: 0.25em;
+  border-bottom: 1px solid var(--md-rule);
+}
+
+.md h3 {
+  font-size: 1.3em;
+}
+
+.md h4 {
+  font-size: 1.08em;
+}
+
+.md h5,
+.md h6 {
+  font-size: 0.95em;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--md-mute);
+}
+
+/* The anchor sits in the margin and only appears on hover, so the heading
+   itself is never pushed around by it. */
+.md :is(h1, h2, h3, h4, h5, h6) > .md-anchor {
+  position: absolute;
+  margin-left: -1.1em;
+  width: 1.1em;
+  color: var(--md-rule);
+  text-decoration: none;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.md :is(h1, h2, h3, h4, h5, h6):hover > .md-anchor,
+.md .md-anchor:focus-visible {
+  opacity: 1;
+}
+
+@media (max-width: 46rem) {
+  .md .md-anchor {
+    display: none;
+  }
+}
+
+/* ---- flow ---- */
+
+.md p,
+.md ul,
+.md ol,
+.md dl,
+.md details {
+  margin: 0 0 1.25em;
+}
+
+.md a {
+  color: var(--md-accent);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.16em;
+}
+
+.md a:hover {
+  text-decoration-thickness: 2px;
+}
+
+.md strong {
+  font-weight: 650;
+}
+
+.md mark {
+  background: var(--md-mark);
+  color: inherit;
+  padding: 0 0.15em;
+}
+
+.md hr {
+  border: 0;
+  height: 1px;
+  background: var(--md-rule);
+  margin: 3em 0;
+}
+
+.md blockquote {
+  margin: 1.75em 0;
+  padding: 0.1em 0 0.1em 1.4em;
+  border-left: 2px solid var(--md-accent);
+  color: var(--md-mute);
+  font-style: italic;
+}
+
+.md blockquote > :last-child {
+  margin-bottom: 0;
+}
+
+.md li {
+  margin: 0.35em 0;
+}
+
+.md li > ul,
+.md li > ol {
+  margin: 0.35em 0;
+}
+
+/* GFM task lists: the bullet would only compete with the checkbox. */
+.md li:has(> input[type='checkbox']) {
+  list-style: none;
+  margin-left: -1.4em;
+}
+
+/* Rendered checkboxes arrive disabled, and a disabled box is dimmed to the
+   point where ticked and unticked look the same. */
+.md li > input[type='checkbox'] {
+  width: 0.95em;
+  height: 0.95em;
+  margin: 0 0.55em 0 0;
+  vertical-align: -0.08em;
+  accent-color: var(--md-accent);
+  opacity: 1;
+}
+
+.md img,
+.md video {
+  max-width: 100%;
+  height: auto;
+  border-radius: 4px;
+}
+
+.md figure {
+  margin: 2em 0;
+}
+
+.md figcaption {
+  font-family: var(--md-display);
+  font-size: 0.8em;
+  color: var(--md-mute);
+  text-align: center;
+  margin-top: 0.6em;
+}
+
+/* ---- code ---- */
+
+.md code,
+.md kbd,
+.md samp {
+  font-family: var(--md-code);
+  font-size: 0.86em;
+  font-variant-ligatures: contextual;
+}
+
+.md :not(pre) > code {
+  background: var(--md-panel);
+  border: 1px solid var(--md-rule);
+  border-radius: 4px;
+  padding: 0.1em 0.35em;
+  white-space: break-spaces;
+}
+
+.md pre {
+  margin: 1.75em 0;
+  padding: 1.1em 1.25em;
+  background: var(--md-panel);
+  border: 1px solid var(--md-rule);
+  border-radius: 6px;
+  overflow-x: auto;
+  line-height: 1.55;
+  tab-size: 2;
+}
+
+.md pre > code {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: 0.82em;
+}
+
+.md kbd {
+  border: 1px solid var(--md-rule);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 0.05em 0.4em;
+  background: var(--md-panel);
+}
+
+/* ---- tables ---- */
+
+/* The wrapper is added by md.js: a wide table has to scroll on its own rather
+   than push the whole page sideways. */
+.md .md-table {
+  overflow-x: auto;
+  margin: 1.75em 0;
+}
+
+.md table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.92em;
+}
+
+.md th,
+.md td {
+  padding: 0.5em 0.85em;
+  border: 1px solid var(--md-rule);
+  text-align: left;
+}
+
+.md th {
+  font-family: var(--md-display);
+  font-weight: 600;
+  font-size: 0.85em;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: var(--md-panel);
+}
+
+/* ---- footnotes, small print ---- */
+
+.md sup a {
+  text-decoration: none;
+  font-family: var(--md-display);
+  font-size: 0.75em;
+}
+
+.md .footnotes {
+  margin-top: 4em;
+  padding-top: 1.5em;
+  border-top: 1px solid var(--md-rule);
+  font-size: 0.9em;
+  color: var(--md-mute);
+}
+
+.md .md-error {
+  font-family: var(--md-display);
+  color: var(--md-mute);
+}
+
+/* ---- preview frame ---- */
+
+/* Inside the file browser's preview the document is a panel, not a page: no
+   generous page margins, and it scrolls within its own frame. */
+.md-framed .md {
+  padding: 1.5rem 1.75rem 3rem;
+  font-size: 1rem;
+}
+
+@media print {
+  body {
+    background: #fff;
+    color: #000;
+  }
+
+  .md {
+    max-width: none;
+    padding: 0;
+  }
+
+  .md .md-anchor {
+    display: none;
+  }
+}

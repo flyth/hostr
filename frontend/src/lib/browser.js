@@ -18,6 +18,7 @@
  * @property {(path: string, isDir: boolean) => Promise<unknown>} [remove] its presence turns on delete controls
  * @property {(dir: string) => void} [onNavigate]
  * @property {boolean} [noRoot] the root is not listable here, so never offer a way back to it
+ * @property {boolean} [markdown] render .md previews as documents rather than as source
  */
 
 const IMAGE = /\.(png|jpe?g|gif|webp|avif|bmp|ico|svg)$/i;
@@ -25,10 +26,37 @@ const VIDEO = /\.(mp4|webm|ogv|mov|m4v)$/i;
 const AUDIO = /\.(mp3|wav|ogg|oga|flac|m4a|aac)$/i;
 const TEXT =
   /\.(txt|md|markdown|json|jsonc|ya?ml|toml|csv|tsv|log|css|js|mjs|ts|tsx|jsx|go|py|rb|rs|sh|sql|xml|html?)$/i;
+const MARKDOWN = /\.(md|markdown)$/i;
 
 // Text previews are read into memory, so they need a ceiling a 200 MB log file
 // cannot walk through.
 const TEXT_LIMIT = 256 * 1024;
+
+/** @type {Promise<any> | null} */
+let markedLoad = null;
+
+// The renderer is 43 KB that most sessions never need, so it arrives the first
+// time someone opens a markdown file and is shared by every preview after that.
+// A script tag rather than an import: this module is bundled by the control
+// panel and inlined verbatim into public listing pages, and only one of those
+// two has a resolver.
+function loadMarked() {
+  const w = /** @type {any} */ (window);
+  if (w.marked) return Promise.resolve(w.marked);
+  if (!markedLoad) {
+    markedLoad = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = '/_hostr/vendor/marked.umd.js';
+      s.onload = () => (w.marked ? resolve(w.marked) : reject(new Error('renderer did not load')));
+      s.onerror = () => {
+        markedLoad = null; // a later preview may as well try again
+        reject(new Error('renderer did not load'));
+      };
+      document.head.append(s);
+    });
+  }
+  return markedLoad;
+}
 
 /**
  * @param {number} n
@@ -257,6 +285,10 @@ export function mount(root, opts) {
       body.append(audio);
       return;
     }
+    if (opts.markdown && MARKDOWN.test(entry.name) && entry.size <= TEXT_LIMIT) {
+      renderMarkdown(body, url, join(dir, entry.name));
+      return;
+    }
     if (TEXT.test(entry.name) && entry.size <= TEXT_LIMIT) {
       const pre = el('pre', null, 'Loading…');
       body.append(pre);
@@ -272,6 +304,74 @@ export function mount(root, opts) {
       return;
     }
     body.append(el('p', 'hb-empty', 'No preview for this file type.'));
+  }
+
+  /**
+   * Rewrites the document's own relative image URLs through whoever knows how
+   * to serve this site's files — the public listing serves them from the site,
+   * the control panel from its API.
+   * @param {string} html
+   * @param {string} at path of the file being previewed
+   * @returns {string}
+   */
+  function rewriteAssets(html, at) {
+    const base = at.includes('/') ? at.slice(0, at.lastIndexOf('/') + 1) : '';
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    doc.querySelectorAll('img[src], video[src], audio[src], source[src]').forEach((node) => {
+      const src = node.getAttribute('src') || '';
+      // Absolute, protocol-relative, rooted or a fragment: not ours to resolve.
+      if (!src || /^([a-z][a-z0-9+.-]*:|\/\/|\/|#)/i.test(src)) return;
+      try {
+        const resolved = new URL(src, 'https://x/' + base).pathname.slice(1);
+        node.setAttribute('src', new URL(opts.href(decodeURIComponent(resolved)), location.href).href);
+      } catch {
+        node.removeAttribute('src'); // a path this malformed has nothing to show
+      }
+    });
+    return doc.body.innerHTML;
+  }
+
+  /**
+   * Renders a markdown preview into a sandboxed frame. The sandbox is the whole
+   * security argument: no allow-scripts and no allow-same-origin means the
+   * document is an opaque origin with scripting switched off, so whatever a
+   * file's author put in it cannot reach the page around it — which in the
+   * control panel is a signed-in session. Nothing here sanitizes the HTML,
+   * because nothing here has to.
+   * @param {HTMLElement} body
+   * @param {string} url
+   * @param {string} at
+   */
+  function renderMarkdown(body, url, at) {
+    const mine = generation;
+    body.append(el('p', 'hb-empty', 'Rendering…'));
+    Promise.all([
+      fetch(url).then((res) => (res.ok ? res.text() : Promise.reject(new Error(`HTTP ${res.status}`)))),
+      loadMarked(),
+    ])
+      .then(([text, marked]) => {
+        if (mine !== generation) return;
+        const doc =
+          '<!doctype html><html><head><meta charset="utf-8">' +
+          '<meta name="viewport" content="width=device-width, initial-scale=1">' +
+          `<link rel="stylesheet" href="${new URL('/_hostr/md.css', location.href).href}">` +
+          // Without allow-popups a click then does nothing, which is the point:
+          // a link must not navigate the preview out from under the reader.
+          '<base target="_blank"></head><body class="md-framed"><main class="md">' +
+          rewriteAssets(marked.parse(text, { gfm: true, breaks: false }), at) +
+          '</main></body></html>';
+        const frame = document.createElement('iframe');
+        frame.className = 'hb-md';
+        frame.setAttribute('sandbox', '');
+        frame.setAttribute('title', 'Rendered preview');
+        frame.srcdoc = doc;
+        body.replaceChildren(frame);
+      })
+      .catch((err) => {
+        if (mine === generation) {
+          body.replaceChildren(el('p', 'hb-empty', `Could not render: ${message(err)}`));
+        }
+      });
   }
 
   /** @param {BrowserEntry} entry */

@@ -331,6 +331,93 @@ func TestTokenListShowsItsLimits(t *testing.T) {
 	}
 }
 
+func TestMarkdownRendering(t *testing.T) {
+	s, ts := newTestServer(t)
+	alice := tenant(t, s, ts, "alice")
+	id := newSite(t, alice, "docs", "docs.test")
+
+	source := "# Title\n\nSome *prose* and a [link](other.md).\n"
+	doc := put(t, alice, id, []byte(source))
+	alice.call("POST", "/api/sites/"+id+"/deploy", map[string]any{"files": map[string]FileEntry{
+		"guide.md": doc,
+	}}, nil)
+
+	browser := func(r *http.Request) { r.Header.Set("Accept", "text/html,*/*") }
+
+	// Off by default: the file is handed over as it was uploaded.
+	body, code, _ := fetch(t, ts.URL, "docs.test", "/guide.md", browser)
+	if code != 200 || body != source {
+		t.Fatalf("markdown should be served as-is while rendering is off: %d %q", code, body)
+	}
+
+	if code := alice.call("PATCH", "/api/sites/"+id, map[string]any{"markdown": true}, nil); code != 200 {
+		t.Fatalf("enable markdown: got %d", code)
+	}
+
+	// A browser gets the shell, and the shell carries no document content —
+	// every byte of it arrives later over `?raw`.
+	body, code, resp := fetch(t, ts.URL, "docs.test", "/guide.md", browser)
+	if code != 200 || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/html") {
+		t.Fatalf("rendered page: %d %q", code, resp.Header.Get("Content-Type"))
+	}
+	if !strings.Contains(body, "/_hostr/md.js") {
+		t.Fatal("rendered page did not load the renderer")
+	}
+	if strings.Contains(body, "Some *prose*") {
+		t.Fatal("rendered page inlined the document instead of fetching it")
+	}
+
+	// ?raw is the way back to the source, as text a browser will display
+	// rather than download.
+	body, code, resp = fetch(t, ts.URL, "docs.test", "/guide.md?raw", browser)
+	if code != 200 || body != source {
+		t.Fatalf("?raw should return the source: %d %q", code, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Fatalf("?raw content type: %q", ct)
+	}
+
+	// A script fetching the file is not asking for a page it cannot run.
+	if body, code, _ := fetch(t, ts.URL, "docs.test", "/guide.md", nil); code != 200 || body != source {
+		t.Fatalf("a non-browser client should get the source: %d %q", code, body)
+	}
+}
+
+func TestReservedAssetPrefix(t *testing.T) {
+	s, ts := newTestServer(t)
+	alice := tenant(t, s, ts, "alice")
+	id := newSite(t, alice, "docs", "docs.test")
+
+	// A tenant deploying over the reserved namespace does not get to serve it.
+	mine := put(t, alice, id, []byte("this is not the stylesheet"))
+	alice.call("POST", "/api/sites/"+id+"/deploy", map[string]any{"files": map[string]FileEntry{
+		"_hostr/md.css": mine,
+	}}, nil)
+
+	body, code, resp := fetch(t, ts.URL, "docs.test", "/_hostr/md.css", nil)
+	if code != 200 {
+		t.Fatalf("reserved asset: got %d", code)
+	}
+	if strings.Contains(body, "not the stylesheet") {
+		t.Fatal("a deployed file shadowed the reserved namespace")
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/css") {
+		t.Fatalf("stylesheet content type: %q", ct)
+	}
+	// The sandboxed preview frame is an opaque origin, so its font requests are
+	// cross-origin and fail silently without this.
+	if resp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatal("assets must be readable from the sandboxed preview frame")
+	}
+
+	if _, code, _ := fetch(t, ts.URL, "docs.test", "/_hostr/../../etc/passwd", nil); code == 200 {
+		t.Fatal("the asset handler escaped its tree")
+	}
+	if _, code, _ := fetch(t, ts.URL, "docs.test", "/_hostr/nope.css", nil); code != 404 {
+		t.Fatalf("unknown asset: got %d", code)
+	}
+}
+
 func TestDirectoryListing(t *testing.T) {
 	s, ts := newTestServer(t)
 	alice := tenant(t, s, ts, "alice")

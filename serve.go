@@ -28,6 +28,14 @@ func (s *Server) serveSite(w http.ResponseWriter, r *http.Request, site *Site) {
 	m := s.storage.Manifest(site.ID)
 	req := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
 
+	// Reserved, and matched before the manifest so no deployed file can take
+	// these names. Behind the site's own auth: a private site should not double
+	// as an open font host.
+	if name, ok := assetRequest(req); ok {
+		s.serveAsset(w, r, name)
+		return
+	}
+
 	// The browser page fetches its rows from the same URL. A query parameter
 	// rather than a reserved path prefix, so no filename in a site can ever
 	// collide with it.
@@ -54,6 +62,19 @@ func (s *Server) serveSite(w http.ResponseWriter, r *http.Request, site *Site) {
 	}
 
 	if name, entry, ok := resolve(m, req); ok {
+		if site.Markdown && isMarkdown(name) {
+			// `?raw` is the way back to the source, and the renderer's own way
+			// of reading it. Plain text rather than text/markdown: the point is
+			// that a browser shows it instead of downloading it.
+			if r.URL.Query().Has("raw") {
+				s.writeBlobAs(w, r, site, name, entry, "text/plain; charset=utf-8", http.StatusOK)
+				return
+			}
+			if wantsDocument(r) {
+				s.serveMarkdownPage(w, r, site, name)
+				return
+			}
+		}
 		s.writeBlob(w, r, site, name, entry, http.StatusOK)
 		return
 	}
@@ -95,7 +116,7 @@ func (s *Server) serveListingPage(w http.ResponseWriter, r *http.Request, site *
 	// No path or filename is interpolated into markup — the shell is static
 	// and every name arrives later as JSON, so there is nothing here for a
 	// hostile filename to break out of.
-	_, _ = w.Write(listingPage(dir, site.Domain, site.ListingNoRoot))
+	_, _ = w.Write(listingPage(dir, site.Domain, site.ListingNoRoot, site.Markdown))
 }
 
 // resolve maps a request path onto a manifest entry, trying the file itself,
@@ -134,6 +155,14 @@ func looksLikeRoute(p string) bool {
 }
 
 func (s *Server) writeBlob(w http.ResponseWriter, r *http.Request, site *Site, name string, e FileEntry, status int) {
+	s.writeBlobAs(w, r, site, name, e, "", status)
+}
+
+// writeBlobAs is writeBlob with the content type decided by the caller. An
+// empty ct means "whatever the extension says", which is every case but the
+// markdown source, where the extension would have the browser download the file
+// the reader just asked to look at.
+func (s *Server) writeBlobAs(w http.ResponseWriter, r *http.Request, site *Site, name string, e FileEntry, ct string, status int) {
 	f, err := s.storage.OpenBlob(site.ID, e.Hash)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -149,7 +178,9 @@ func (s *Server) writeBlob(w http.ResponseWriter, r *http.Request, site *Site, n
 	}
 	defer f.Close()
 
-	ct := mime.TypeByExtension(path.Ext(name))
+	if ct == "" {
+		ct = mime.TypeByExtension(path.Ext(name))
+	}
 	if ct == "" {
 		ct = "application/octet-stream"
 	}

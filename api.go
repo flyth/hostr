@@ -104,6 +104,10 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "no such endpoint")
 	})
+	// The same reserved namespace as a tenant site. The panel's file browser
+	// renders markdown previews with the stylesheet and typefaces from here,
+	// and its frame resolves those URLs against this origin.
+	mux.HandleFunc("GET /"+assetPrefix, s.handleAsset)
 	mux.HandleFunc("/", s.serveSPA)
 	return mux
 }
@@ -420,6 +424,7 @@ func (s *Server) handlePatchSite(w http.ResponseWriter, r *http.Request, c calle
 		Domain        *string `json:"domain"`
 		Listing       *bool   `json:"listing"`
 		ListingNoRoot *bool   `json:"listing_no_root"`
+		Markdown      *bool   `json:"markdown"`
 		ScopedOnly    *bool   `json:"scoped_only"`
 		AuthUser      *string `json:"auth_user"`
 		AuthPass      *string `json:"auth_password"`
@@ -458,7 +463,12 @@ func (s *Server) handlePatchSite(w http.ResponseWriter, r *http.Request, c calle
 			return
 		}
 	}
-	set := siteSettings{Listing: req.Listing, ListingNoRoot: req.ListingNoRoot, ScopedOnly: req.ScopedOnly}
+	set := siteSettings{
+		Listing:       req.Listing,
+		ListingNoRoot: req.ListingNoRoot,
+		Markdown:      req.Markdown,
+		ScopedOnly:    req.ScopedOnly,
+	}
 	if !set.empty() {
 		if err := s.db.SetSiteSettings(site.ID, set); err != nil {
 			writeStoreErr(w, err)

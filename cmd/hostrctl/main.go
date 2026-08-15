@@ -81,7 +81,7 @@ func usage() {
   push     -site S [-scope DIR] [-as PATH] FILE...  upload files, delete nothing
   ls       -site S [PATH]            list one directory of a site
   rm       -site S [-r] PATH...      delete files or a whole directory
-  settings -site S [-listing] [-no-root-listing] [-scope-only] [-auth-user U] [-no-auth]
+  settings -site S [-listing] [-no-root-listing] [-markdown] [-scope-only] [-auth-user U] [-no-auth]
   token    -name N [-site S] [-scope DIR]...  mint an API token
   status   -site S                   show a site's current deployment
   share    -site S -user NAME [-remove]  manage collaborators
@@ -315,6 +315,7 @@ type site struct {
 	Mine       bool      `json:"mine"`
 	Listing    bool      `json:"listing"`
 	NoRootList bool      `json:"listing_no_root"`
+	Markdown   bool      `json:"markdown"`
 	ScopedOnly bool      `json:"scoped_only"`
 	Protected  bool      `json:"protected"`
 }

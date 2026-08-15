@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import { get, post, patch, del, humanBytes, ago, type Listing, type Site, type Token } from '$lib/api';
@@ -72,6 +73,11 @@
     const siteId = id;
     mountBrowser(el, {
       path: '',
+      // Read untracked on purpose: this effect must depend on the element and
+      // the site id and nothing else. Tracking `site` would remount the browser
+      // — losing the directory the reader is standing in — every time a delete
+      // or a settings change reloads the record.
+      markdown: untrack(() => !!site?.markdown),
       list: (dir: string) => get<Listing>(`/api/sites/${siteId}/files?path=${encodeURIComponent(dir)}`),
       // Previews come back through the API rather than from the site's own
       // domain, so they work while the site is behind basic auth and never
@@ -106,7 +112,7 @@
   const saveDomain = () =>
     act(() => patch(`/api/sites/${id}`, { domain: domain.trim() }), 'Domain updated.');
 
-  const toggle = (field: 'listing' | 'listing_no_root' | 'scoped_only', value: boolean) =>
+  const toggle = (field: 'listing' | 'listing_no_root' | 'markdown' | 'scoped_only', value: boolean) =>
     act(() => patch(`/api/sites/${id}`, { [field]: value }), 'Setting saved.');
 
   const saveAuth = () =>
@@ -277,6 +283,24 @@ hostrctl push   -site {site.slug} -scope my-website render.png</pre>
           </span>
         </label>
       {/if}
+
+      <label class="flex items-start gap-2 text-sm">
+        <input
+          type="checkbox"
+          class="mt-1"
+          checked={site.markdown}
+          onchange={(e) => toggle('markdown', e.currentTarget.checked)}
+        />
+        <span>
+          Render markdown files
+          <span class="text-mute block text-xs">
+            A <code>.md</code> file opens as a typeset document instead of downloading, and previews
+            here render the same way. <code>?raw</code> always returns the source. A rendered
+            document runs any HTML in it on the site's own origin — the same trust an uploaded
+            <code>.html</code> file already has.
+          </span>
+        </span>
+      </label>
 
       <label class="flex items-start gap-2 text-sm">
         <input
