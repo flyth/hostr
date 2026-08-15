@@ -50,6 +50,7 @@ export type Site = {
   mine: boolean;
   created: string;
   listing: boolean;
+  listing_no_root: boolean;
   scoped_only: boolean;
   /** Whether basic auth is set. The username never leaves the server — it is
    *  half of that credential. */
@@ -62,6 +63,7 @@ export type Token = {
   created: string;
   last_used?: string;
   site?: string;
+  site_slug?: string;
   scopes?: string[];
 };
 

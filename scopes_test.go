@@ -287,6 +287,50 @@ func TestScopedTokenIsConfined(t *testing.T) {
 	}
 }
 
+// The token list is the only place a token's limits are visible after minting,
+// so it has to carry them — including the slug behind the site ID, which is all
+// the panel has to render.
+func TestTokenListShowsItsLimits(t *testing.T) {
+	s, ts := newTestServer(t)
+	alice := tenant(t, s, ts, "alice")
+	id := newSite(t, alice, "play", "play.test")
+
+	alice.call("POST", "/api/tokens", map[string]any{"name": "wide"}, nil)
+	alice.call("POST", "/api/tokens", map[string]any{
+		"name": "narrow", "site": id, "scopes": []string{"drafts"},
+	}, nil)
+
+	var tokens []struct {
+		Name     string   `json:"name"`
+		Site     string   `json:"site"`
+		SiteSlug string   `json:"site_slug"`
+		Scopes   []string `json:"scopes"`
+	}
+	if code := alice.call("GET", "/api/tokens", nil, &tokens); code != 200 {
+		t.Fatalf("list tokens: got %d", code)
+	}
+	seen := map[string]bool{}
+	for _, tk := range tokens {
+		seen[tk.Name] = true
+		switch tk.Name {
+		case "wide":
+			if tk.Site != "" || len(tk.Scopes) != 0 || tk.SiteSlug != "" {
+				t.Fatalf("an unrestricted token should list no limits: %+v", tk)
+			}
+		case "narrow":
+			if tk.Site != id || tk.SiteSlug != "play" {
+				t.Fatalf("a site-bound token must name its site: %+v", tk)
+			}
+			if len(tk.Scopes) != 1 || tk.Scopes[0] != "drafts" {
+				t.Fatalf("a scoped token must list its scopes: %+v", tk)
+			}
+		}
+	}
+	if !seen["wide"] || !seen["narrow"] {
+		t.Fatalf("token list is missing entries: %+v", tokens)
+	}
+}
+
 func TestDirectoryListing(t *testing.T) {
 	s, ts := newTestServer(t)
 	alice := tenant(t, s, ts, "alice")
@@ -341,6 +385,30 @@ func TestDirectoryListing(t *testing.T) {
 	// A directory URL without its slash redirects rather than 404s.
 	if _, code, resp := fetch(t, ts.URL, "play.test", "/gallery", nil); code != 301 {
 		t.Fatalf("directory redirect: got %d (%s)", code, resp.Header.Get("Location"))
+	}
+
+	// The root can be held back on its own: subdirectories stay browsable, but
+	// nothing walks the site from `/`, over the page or the JSON feed.
+	if code := alice.call("PATCH", "/api/sites/"+id, map[string]any{"listing_no_root": true}, nil); code != 200 {
+		t.Fatalf("enable listing_no_root: got %d", code)
+	}
+	if _, code, _ := fetch(t, ts.URL, "play.test", "/", nil); code != 404 {
+		t.Fatalf("root listed while listing_no_root is on: got %d", code)
+	}
+	if _, code, _ := fetch(t, ts.URL, "play.test", "/?_hostr=ls", nil); code != 404 {
+		t.Fatalf("root listing JSON served while listing_no_root is on: got %d", code)
+	}
+	sub, code, _ := fetch(t, ts.URL, "play.test", "/gallery/sub/", nil)
+	if code != 200 {
+		t.Fatalf("listing_no_root should only hold back the root: got %d", code)
+	}
+	// The page has to know, or its own crumbs and walk-up would send a visitor
+	// to a root that answers 404 and leave the address bar there.
+	if !strings.Contains(sub, "noRoot: true") {
+		t.Fatal("listing page did not tell the browser the root is off-limits")
+	}
+	if code := alice.call("PATCH", "/api/sites/"+id, map[string]any{"listing_no_root": false}, nil); code != 200 {
+		t.Fatalf("disable listing_no_root: got %d", code)
 	}
 	// An index.html still wins over the listing.
 	page := put(t, alice, id, []byte("<h1>gallery</h1>"))

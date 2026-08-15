@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { get, post, del, ago, type Token } from '$lib/api';
+  import TokenLimits from '$lib/TokenLimits.svelte';
   import { session } from '$lib/session.svelte';
 
   let tokens = $state<Token[]>([]);
@@ -79,12 +80,13 @@
 
   <ul class="space-y-2">
     {#each tokens as t (t.id)}
-      <li class="card flex items-center justify-between p-3 text-sm">
-        <span>
+      <li class="card flex items-center justify-between gap-3 p-3 text-sm">
+        <span class="min-w-0">
           {t.name}
           <span class="text-mute text-xs">· created {ago(t.created)} · last used {ago(t.last_used)}</span>
+          <span class="block"><TokenLimits token={t} /></span>
         </span>
-        <button class="btn btn-danger text-xs" onclick={() => revoke(t.id)}>Revoke</button>
+        <button class="btn btn-danger shrink-0 text-xs" onclick={() => revoke(t.id)}>Revoke</button>
       </li>
     {:else}
       <li class="text-mute text-sm">No tokens yet.</li>

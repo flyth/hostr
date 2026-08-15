@@ -38,6 +38,11 @@ type Site struct {
 	// enumerable, which is a real disclosure for anyone who was relying on a
 	// URL being unguessable.
 	Listing bool `json:"listing"`
+	// ListingNoRoot keeps the site root out of the browser while leaving every
+	// directory below it listable. A visitor who already knows a path can browse
+	// it; nobody can walk the whole site starting from `/`. Only meaningful
+	// while Listing is on.
+	ListingNoRoot bool `json:"listing_no_root"`
 	// ScopedOnly refuses any write that is not confined to a scope: no
 	// whole-site deploy, no whole-site delete, and no writing or deleting a
 	// file at the top level. Deleting one named scope is still a scoped write
@@ -517,20 +522,36 @@ func (db *DB) DeleteSite(id string) error {
 	return db.save()
 }
 
-// SetSiteSettings applies whichever flags the caller actually sent; a nil
-// pointer leaves that flag alone.
-func (db *DB) SetSiteSettings(id string, listing, scopedOnly *bool) error {
+// siteSettings carries the boolean site flags of a settings change. A nil
+// pointer means the caller did not send that flag and it keeps its value. They
+// travel as one struct rather than as positional arguments: they are all the
+// same type, and swapping two of them would silently flip the wrong switch.
+type siteSettings struct {
+	Listing       *bool
+	ListingNoRoot *bool
+	ScopedOnly    *bool
+}
+
+func (set siteSettings) empty() bool {
+	return set.Listing == nil && set.ListingNoRoot == nil && set.ScopedOnly == nil
+}
+
+// SetSiteSettings applies whichever flags the caller actually sent.
+func (db *DB) SetSiteSettings(id string, set siteSettings) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	s, ok := db.d.Sites[id]
 	if !ok {
 		return errNotFound
 	}
-	if listing != nil {
-		s.Listing = *listing
+	if set.Listing != nil {
+		s.Listing = *set.Listing
 	}
-	if scopedOnly != nil {
-		s.ScopedOnly = *scopedOnly
+	if set.ListingNoRoot != nil {
+		s.ListingNoRoot = *set.ListingNoRoot
+	}
+	if set.ScopedOnly != nil {
+		s.ScopedOnly = *set.ScopedOnly
 	}
 	return db.save()
 }
@@ -658,6 +679,15 @@ func (t *Token) allowsFile(p string) bool {
 		}
 	}
 	return false
+}
+
+// listable reports whether dir may be served as a directory listing, where dir
+// is manifest-relative and "" is the site root.
+func (s *Site) listable(dir string) bool {
+	if !s.Listing {
+		return false
+	}
+	return dir != "" || !s.ListingNoRoot
 }
 
 // allows reports whether u may read and deploy this site. Admins are the

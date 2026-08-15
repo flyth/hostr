@@ -21,7 +21,7 @@ var browserCSS string
 // module inlined and nothing else. Every name arrives afterwards as JSON over
 // fetch rather than being interpolated into markup, so a file called
 // `<script>` is inert here.
-func listingPage(dir, domain string) []byte {
+func listingPage(dir, domain string, noRoot bool) []byte {
 	start, _ := json.Marshal(dir) // json escapes <, > and & by default
 
 	var b bytes.Buffer
@@ -55,6 +55,13 @@ const fromURL = () => location.pathname.split('/').filter(Boolean).map(decodeURI
 const browser = mount(document.getElementById('hostr-browser'), {
   path: `)
 	b.Write(start)
+	b.WriteString(`,
+  noRoot: `)
+	if noRoot {
+		b.WriteString("true")
+	} else {
+		b.WriteString("false")
+	}
 	b.WriteString(`,
   list: async (dir) => {
     const res = await fetch(urlFor(dir) + '?_hostr=ls', { headers: { accept: 'application/json' } });

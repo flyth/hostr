@@ -280,6 +280,7 @@ func cmdSettings(args []string) error {
 	fset := flag.NewFlagSet("settings", flag.ExitOnError)
 	name := fset.String("site", "", "site slug, domain or id")
 	listingOn := fset.Bool("listing", false, "serve a file browser where a directory has no index.html")
+	noRootList := fset.Bool("no-root-listing", false, "with -listing on, refuse to list the site root")
 	scopeOnly := fset.Bool("scope-only", false, "refuse any write that is not confined to a scope")
 	authUser := fset.String("auth-user", "", "username for the basic auth prompt in front of the site")
 	authPass := fset.String("auth-password", "", "password for basic auth; prompted for if omitted")
@@ -303,6 +304,8 @@ func cmdSettings(args []string) error {
 		switch f.Name {
 		case "listing":
 			body["listing"] = *listingOn
+		case "no-root-listing":
+			body["listing_no_root"] = *noRootList
 		case "scope-only":
 			body["scoped_only"] = *scopeOnly
 		}
@@ -324,17 +327,18 @@ func cmdSettings(args []string) error {
 
 	if len(body) == 0 {
 		fmt.Printf("%s (%s)\n", s.Slug, s.Domain)
-		fmt.Printf("  listing     %s\n", onOff(s.Listing))
-		fmt.Printf("  scope-only  %s\n", onOff(s.ScopedOnly))
-		fmt.Printf("  basic auth  %s\n", onOff(s.Protected))
+		fmt.Printf("  listing         %s\n", onOff(s.Listing))
+		fmt.Printf("  no-root-listing %s\n", onOff(s.NoRootList))
+		fmt.Printf("  scope-only      %s\n", onOff(s.ScopedOnly))
+		fmt.Printf("  basic auth      %s\n", onOff(s.Protected))
 		return nil
 	}
 	var out site
 	if err := c.patchJSON("/api/sites/"+s.ID, body, &out); err != nil {
 		return err
 	}
-	fmt.Printf("%s: listing %s, scope-only %s, basic auth %s\n",
-		out.Slug, onOff(out.Listing), onOff(out.ScopedOnly), onOff(out.Protected))
+	fmt.Printf("%s: listing %s, no-root-listing %s, scope-only %s, basic auth %s\n",
+		out.Slug, onOff(out.Listing), onOff(out.NoRootList), onOff(out.ScopedOnly), onOff(out.Protected))
 	return nil
 }
 
