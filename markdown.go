@@ -5,6 +5,7 @@ import (
 	"html"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 )
 
@@ -59,9 +60,40 @@ func isMarkdown(name string) bool {
 // wantsDocument distinguishes a browser opening a page from a script fetching a
 // file. `curl site/readme.md` should still get markdown rather than a shell
 // full of JavaScript it cannot run, and only a browser navigation asks for
-// text/html.
+// text/html by name — `*/*` deliberately does not count.
+//
+// Each entry is matched whole rather than by substring: `text/html;q=0` is a
+// client saying it will not take HTML, and a type called `notext/htmlish` is
+// not text/html at all.
 func wantsDocument(r *http.Request) bool {
-	return strings.Contains(r.Header.Get("Accept"), "text/html")
+	for _, entry := range strings.Split(r.Header.Get("Accept"), ",") {
+		media, params, _ := strings.Cut(entry, ";")
+		if !strings.EqualFold(strings.TrimSpace(media), "text/html") {
+			continue
+		}
+		if quality(params) == 0 {
+			return false // named it only to refuse it
+		}
+		return true
+	}
+	return false
+}
+
+// quality reads the q parameter of one Accept entry. Anything unparseable is
+// treated as the default of 1: a malformed q is not a refusal.
+func quality(params string) float64 {
+	for _, p := range strings.Split(params, ";") {
+		k, v, ok := strings.Cut(p, "=")
+		if !ok || !strings.EqualFold(strings.TrimSpace(k), "q") {
+			continue
+		}
+		q, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return 1
+		}
+		return q
+	}
+	return 1
 }
 
 func (s *Server) serveMarkdownPage(w http.ResponseWriter, r *http.Request, site *Site, name string) {

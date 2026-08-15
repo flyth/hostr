@@ -1,10 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
+	"io"
 	"io/fs"
 	"net/http"
 	"path"
@@ -74,9 +74,19 @@ func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request, name string)
 		http.Error(w, "404 not found", http.StatusNotFound)
 		return
 	}
-	b, err := fs.ReadFile(assetTree, name)
+	f, err := assetTree.Open(name)
 	if err != nil {
 		http.Error(w, "404 not found", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+	// An embedded file seeks over the bytes already in the binary. Reading it
+	// into a fresh buffer instead would copy 140 KB of font on every request,
+	// including the revalidations that this cache policy makes the common case
+	// and that answer with an empty 304.
+	rs, ok := f.(io.ReadSeeker)
+	if !ok {
+		http.Error(w, "500 asset error", http.StatusInternalServerError)
 		return
 	}
 
@@ -93,12 +103,20 @@ func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request, name string)
 	// opaque origin — its font requests are cross-origin and need this to be
 	// allowed at all. These bytes are public and carry no credentials.
 	h.Set("Access-Control-Allow-Origin", "*")
-	http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(b))
+	http.ServeContent(w, r, name, time.Time{}, rs)
 }
 
 // assetRequest reports whether a cleaned request path belongs to the reserved
 // namespace, and returns the name within the asset tree.
+//
+// The bare `_hostr` counts. Cleaning a path drops its trailing slash, so a
+// request for `/_hostr/` arrives here as `_hostr` and would otherwise fall
+// through to the manifest — where a tenant's own `_hostr/index.html` was happy
+// to answer, on a prefix this server tells everyone it owns.
 func assetRequest(req string) (string, bool) {
+	if req == strings.TrimSuffix(assetPrefix, "/") {
+		return "", true // no such asset, but not the tenant's to answer either
+	}
 	if !strings.HasPrefix(req, assetPrefix) {
 		return "", false
 	}
@@ -109,6 +127,12 @@ func assetRequest(req string) (string, bool) {
 // browser renders markdown previews with the same stylesheet as a public page,
 // and its frame resolves those URLs against the panel's own origin.
 func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
-	name := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/"+assetPrefix)
+	// Normalized and matched exactly as it is on a tenant domain: two rules for
+	// one namespace is how the two drift apart.
+	name, ok := assetRequest(strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/"))
+	if !ok {
+		http.Error(w, "404 not found", http.StatusNotFound)
+		return
+	}
 	s.serveAsset(w, r, name)
 }

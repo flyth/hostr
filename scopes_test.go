@@ -381,6 +381,28 @@ func TestMarkdownRendering(t *testing.T) {
 	if body, code, _ := fetch(t, ts.URL, "docs.test", "/guide.md", nil); code != 200 || body != source {
 		t.Fatalf("a non-browser client should get the source: %d %q", code, body)
 	}
+
+	// One URL, two representations, one of them cacheable: a shared cache that
+	// keyed on the URL alone would hand a browser the download.
+	for _, mod := range []func(*http.Request){browser, nil} {
+		if _, _, resp := fetch(t, ts.URL, "docs.test", "/guide.md", mod); resp.Header.Get("Vary") != "Accept" {
+			t.Fatalf("markdown responses must vary on Accept, got %q", resp.Header.Get("Vary"))
+		}
+	}
+
+	// Naming text/html only to refuse it is not a request for a document, and
+	// a type that merely contains the string is not text/html at all.
+	for _, accept := range []string{"text/html;q=0", "notext/htmlish/x, application/json", "*/*"} {
+		mod := func(r *http.Request) { r.Header.Set("Accept", accept) }
+		if body, _, _ := fetch(t, ts.URL, "docs.test", "/guide.md", mod); body != source {
+			t.Fatalf("Accept %q should not get the shell", accept)
+		}
+	}
+	if body, _, _ := fetch(t, ts.URL, "docs.test", "/guide.md", func(r *http.Request) {
+		r.Header.Set("Accept", "text/html;q=0.9, */*;q=0.8")
+	}); body == source {
+		t.Fatal("a browser-style Accept with a q value should get the shell")
+	}
 }
 
 func TestReservedAssetPrefix(t *testing.T) {
@@ -388,11 +410,20 @@ func TestReservedAssetPrefix(t *testing.T) {
 	alice := tenant(t, s, ts, "alice")
 	id := newSite(t, alice, "docs", "docs.test")
 
-	// A tenant deploying over the reserved namespace does not get to serve it.
+	// A tenant deploying over the reserved namespace does not get to serve it —
+	// including at the prefix's own root, where cleaning the trailing slash off
+	// `/_hostr/` used to drop the request through to their own index.
 	mine := put(t, alice, id, []byte("this is not the stylesheet"))
 	alice.call("POST", "/api/sites/"+id+"/deploy", map[string]any{"files": map[string]FileEntry{
-		"_hostr/md.css": mine,
+		"_hostr/md.css":     mine,
+		"_hostr/index.html": mine,
 	}}, nil)
+
+	for _, p := range []string{"/_hostr/", "/_hostr", "/_hostr//", "/_hostr/./"} {
+		if body, code, _ := fetch(t, ts.URL, "docs.test", p, nil); code == 200 && strings.Contains(body, "not the stylesheet") {
+			t.Fatalf("%s served a deployed file from the reserved namespace", p)
+		}
+	}
 
 	body, code, resp := fetch(t, ts.URL, "docs.test", "/_hostr/md.css", nil)
 	if code != 200 {
