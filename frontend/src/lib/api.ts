@@ -51,6 +51,7 @@ export type Site = {
   created: string;
   listing: boolean;
   listing_no_root: boolean;
+  markdown: boolean;
   scoped_only: boolean;
   /** Whether basic auth is set. The username never leaves the server — it is
    *  half of that credential. */

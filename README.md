@@ -202,6 +202,51 @@ browses from a path they were given, and nobody walks the site from the top.
 This pairs with scoped tokens: each scope keeps its own browsable subtree
 without the scope names themselves being on display at the root.
 
+## Rendering markdown
+
+Off by default. Switched on, a `.md` file opened in a browser is typeset as a
+document instead of downloading:
+
+```sh
+hostrctl settings -site playground -markdown=true
+```
+
+`?raw` always returns the source as plain text, and a client that did not ask
+for `text/html` — `curl`, a script, a feed reader — gets the source too, so
+nothing that fetched a markdown file before starts receiving a page of
+JavaScript instead.
+
+Rendering happens in the browser. The server ships the shell and the document
+arrives over `?raw`, which is what keeps relative links and images inside the
+file working: the page is served at the file's own URL. GitHub-flavoured
+markdown — tables, task lists, strikethrough, autolinks — comes from
+[marked](https://github.com/markedjs/marked). There is no syntax highlighting;
+code blocks are set in Fira Code and left alone.
+
+With directory listing on as well, the file browser's preview pane renders
+markdown the same way, from the same stylesheet.
+
+**What turning this on changes.** A rendered document runs whatever HTML and
+script the markdown contains, on the site's own origin. That is the same trust
+a deployed `.html` file already carries, but it is *not* the trust a `.md` file
+carried a moment earlier, and a scoped agent token that can write `docs/` can
+write that markdown. The control panel is the one place this would be somebody
+else's origin, so previews there render inside a sandboxed frame with scripting
+off — a hostile file cannot reach the session around it.
+
+### The `/_hostr/` namespace
+
+The stylesheet, the three typefaces and the renderer are compiled into the
+binary and served from `/_hostr/` on every site, matched before the site's own
+files. Nothing you deploy under that path will ever be served — the name is
+reserved on every site, listing or no listing, markdown or no markdown.
+
+The typefaces are [Newsreader](https://github.com/productiontype/Newsreader) for
+text, [Archivo](https://github.com/Omnibus-Type/Archivo) for headings and
+[Fira Code](https://github.com/tonsky/FiraCode) for code, all under the SIL Open
+Font License, latin subsets only, and each one's licence is served alongside it
+at `/_hostr/fonts/`.
+
 ## Password protection
 
 A site can sit behind a basic auth prompt, pages and listings alike:
