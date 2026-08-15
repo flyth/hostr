@@ -63,6 +63,11 @@ func (s *Server) serveSite(w http.ResponseWriter, r *http.Request, site *Site) {
 
 	if name, entry, ok := resolve(m, req); ok {
 		if site.Markdown && isMarkdown(name) {
+			// This URL now has two representations, and the source one is
+			// cacheable. Without this a shared cache stores whichever was asked
+			// for first and hands a navigating browser an octet-stream to
+			// download — the exact thing the flag exists to stop.
+			w.Header().Set("Vary", "Accept")
 			// `?raw` is the way back to the source, and the renderer's own way
 			// of reading it. Plain text rather than text/markdown: the point is
 			// that a browser shows it instead of downloading it.

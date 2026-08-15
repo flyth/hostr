@@ -317,15 +317,21 @@ export function mount(root, opts) {
   function rewriteAssets(html, at) {
     const base = at.includes('/') ? at.slice(0, at.lastIndexOf('/') + 1) : '';
     const doc = new DOMParser().parseFromString(html, 'text/html');
-    doc.querySelectorAll('img[src], video[src], audio[src], source[src]').forEach((node) => {
-      const src = node.getAttribute('src') || '';
-      // Absolute, protocol-relative, rooted or a fragment: not ours to resolve.
-      if (!src || /^([a-z][a-z0-9+.-]*:|\/\/|\/|#)/i.test(src)) return;
-      try {
-        const resolved = new URL(src, 'https://x/' + base).pathname.slice(1);
-        node.setAttribute('src', new URL(opts.href(decodeURIComponent(resolved)), location.href).href);
-      } catch {
-        node.removeAttribute('src'); // a path this malformed has nothing to show
+    doc.querySelectorAll('img, video, audio, source').forEach((node) => {
+      // A srcset wins over src where both are given, and rewriting a candidate
+      // list correctly is more machinery than a preview pane is worth. Dropping
+      // it leaves the plain src, which is the same picture.
+      node.removeAttribute('srcset');
+      for (const attr of ['src', 'poster']) {
+        const value = node.getAttribute(attr) || '';
+        // Absolute, protocol-relative, rooted or a fragment: not ours to resolve.
+        if (!value || /^([a-z][a-z0-9+.-]*:|\/\/|\/|#)/i.test(value)) continue;
+        try {
+          const resolved = new URL(value, 'https://x/' + base).pathname.slice(1);
+          node.setAttribute(attr, new URL(opts.href(decodeURIComponent(resolved)), location.href).href);
+        } catch {
+          node.removeAttribute(attr); // a path this malformed has nothing to show
+        }
       }
     });
     return doc.body.innerHTML;
@@ -351,9 +357,16 @@ export function mount(root, opts) {
     ])
       .then(([text, marked]) => {
         if (mine !== generation) return;
+        const origin = location.origin;
         const doc =
           '<!doctype html><html><head><meta charset="utf-8">' +
           '<meta name="viewport" content="width=device-width, initial-scale=1">' +
+          // The sandbox stops script; this stops the quieter thing. An
+          // `<img src="https://someone-else/p.png">` in a file would otherwise
+          // report to its author every time an operator opened the preview.
+          '<meta http-equiv="Content-Security-Policy" content="' +
+          `default-src 'none'; style-src ${origin}; font-src ${origin}; ` +
+          `img-src ${origin} data:; media-src ${origin} data:">` +
           `<link rel="stylesheet" href="${new URL('/_hostr/md.css', location.href).href}">` +
           // Without allow-popups a click then does nothing, which is the point:
           // a link must not navigate the preview out from under the reader.

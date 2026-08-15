@@ -23,11 +23,14 @@
   // Heading ids GitHub-style, so an anchor written by hand in the document —
   // or a link from another page — lands where its author expected.
   function slug(text, taken) {
+    // Punctuation goes first and whitespace becomes hyphens after, one for one.
+    // Doing it the other way around collapses `C++ & Rust` to `c-rust` where
+    // GitHub gives `c--rust`, and a hand-written anchor would miss.
     var base = text
       .toLowerCase()
       .trim()
-      .replace(/[^\w\- ]+/g, '')
-      .replace(/\s+/g, '-');
+      .replace(/[^\w\s-]+/g, '')
+      .replace(/\s/g, '-');
     if (!base) base = 'section';
     var id = base;
     for (var n = 1; taken[id]; n++) id = base + '-' + n;
@@ -37,6 +40,10 @@
 
   function decorate() {
     var taken = {};
+    // Read before the anchors go in: prepending one puts its own "#" into the
+    // heading's textContent, and the tab title would inherit it.
+    var first = root.querySelector('h1');
+    var title = first && first.textContent ? first.textContent.trim() : '';
     root.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach(function (h) {
       if (!h.id) h.id = slug(h.textContent || '', taken);
       var a = document.createElement('a');
@@ -53,8 +60,7 @@
       t.replaceWith(box);
       box.append(t);
     });
-    var h1 = root.querySelector('h1');
-    if (h1 && h1.textContent) document.title = h1.textContent.trim();
+    if (title) document.title = title;
   }
 
   fetch(location.pathname + '?raw', { headers: { accept: 'text/plain' } })
