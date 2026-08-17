@@ -183,6 +183,14 @@ func (t *throttle) blocked(key string) bool {
 	return ok && now.Before(e.until) && e.n >= t.limit
 }
 
+// ponytail: a hard cap rather than smarter eviction. Site auth keys include the
+// submitted username, so a client can mint fresh keys at will; expired entries
+// are swept on every call and this stops a flood from growing the map without
+// bound in between. Dropping the lot only forgets failure counts, which the same
+// client could achieve by changing username anyway. Make it an LRU if a server
+// ever faces this at volume.
+const throttleMax = 8192
+
 func (t *throttle) fail(key string) {
 	now := time.Now()
 	t.mu.Lock()
@@ -191,6 +199,9 @@ func (t *throttle) fail(key string) {
 		if now.After(e.until) {
 			delete(t.m, k)
 		}
+	}
+	if len(t.m) >= throttleMax {
+		clear(t.m)
 	}
 	if e, ok := t.m[key]; ok {
 		e.n++
@@ -209,13 +220,13 @@ func (t *throttle) reset(key string) {
 
 // ponytail: verified credentials are memoised for an hour rather than
 // re-hashed per request. Argon2id at 64 MiB is ~50 ms — fine once per visitor,
-// ruinous on a page with forty images. The key mixes in the stored hash, so
-// changing or clearing a site's password invalidates its entries with no
-// bookkeeping. Swap for a signed cookie if the memoisation window ever needs
-// to survive a restart.
+// ruinous on a page with forty images. The key mixes in a digest of every
+// credential the site holds, so adding an account, removing one or changing any
+// password invalidates its entries with no bookkeeping. Swap for a signed cookie
+// if the memoisation window ever needs to survive a restart.
 type authCache struct {
 	mu sync.Mutex
-	m  map[string]time.Time
+	m  map[string]authEntry
 
 	// verify serialises the argon2 work itself. A page with forty images
 	// produces forty simultaneous requests carrying the same credentials, and
@@ -230,34 +241,42 @@ type authCache struct {
 	verify sync.Mutex
 }
 
+// authEntry remembers which account a memoised credential belongs to, so a
+// cache hit still attributes its traffic to the right one rather than counting
+// every returning visitor as anonymous.
+type authEntry struct {
+	account string
+	expires time.Time
+}
+
 const siteAuthTTL = time.Hour
 
-func newAuthCache() *authCache { return &authCache{m: map[string]time.Time{}} }
+func newAuthCache() *authCache { return &authCache{m: map[string]authEntry{}} }
 
-func (c *authCache) key(siteID, storedHash, header string) string {
-	return sha256hex(siteID + "\x00" + storedHash + "\x00" + header)
+func (c *authCache) key(siteID, fingerprint, header string) string {
+	return sha256hex(siteID + "\x00" + fingerprint + "\x00" + header)
 }
 
-func (c *authCache) ok(key string) bool {
+func (c *authCache) ok(key string) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	exp, ok := c.m[key]
+	e, ok := c.m[key]
 	if !ok {
-		return false
+		return "", false
 	}
-	if time.Now().After(exp) {
+	if time.Now().After(e.expires) {
 		delete(c.m, key)
-		return false
+		return "", false
 	}
-	return true
+	return e.account, true
 }
 
-func (c *authCache) put(key string) {
+func (c *authCache) put(key, account string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := time.Now()
-	for k, exp := range c.m {
-		if now.After(exp) {
+	for k, e := range c.m {
+		if now.After(e.expires) {
 			delete(c.m, k)
 		}
 	}
@@ -267,63 +286,90 @@ func (c *authCache) put(key string) {
 	if len(c.m) > 4096 {
 		clear(c.m)
 	}
-	c.m[key] = now.Add(siteAuthTTL)
+	c.m[key] = authEntry{account: account, expires: now.Add(siteAuthTTL)}
 }
 
-// checkSiteAuth gates a tenant site behind its basic-auth credentials, if it
-// has any. It answers the request itself and returns false when the caller may
-// not proceed.
-func (s *Server) checkSiteAuth(w http.ResponseWriter, r *http.Request, site *Site) bool {
-	if site.AuthUser == "" || site.AuthHash == "" {
-		return true
+// checkSiteAuth gates a tenant site behind its basic-auth accounts, if it has
+// any. It answers the request itself and returns false when the caller may not
+// proceed; the string it returns on success is the account that opened the
+// site, which is empty when the site has no password at all.
+//
+// realm is the hostname the request actually arrived on, not the site's
+// canonical domain: a guest link must not disclose that, and a browser scopes
+// stored credentials per host anyway.
+func (s *Server) checkSiteAuth(w http.ResponseWriter, r *http.Request, site *Site, realm string) (string, bool) {
+	if len(site.Accounts) == 0 {
+		return "", true
 	}
-	deny := func(status int, msg string) bool {
-		// The realm is the site's own domain so a browser keeps one site's
-		// credentials separate from another's.
-		w.Header().Set("WWW-Authenticate", `Basic realm="`+site.Domain+`", charset="UTF-8"`)
+	deny := func(status int, msg string) (string, bool) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="`+realm+`", charset="UTF-8"`)
 		w.Header().Set("Cache-Control", "no-store")
 		http.Error(w, msg, status)
-		return false
+		return "", false
 	}
 
 	header := r.Header.Get("Authorization")
 	if header == "" {
 		return deny(http.StatusUnauthorized, "401 authentication required")
 	}
-	key := s.siteAuth.key(site.ID, site.AuthHash, header)
+	key := s.siteAuth.key(site.ID, site.authFingerprint(), header)
 	// A credential that has already been verified never touches the throttle,
 	// so a visitor who is signed in stays signed in while someone else is
 	// guessing — which matters because behind a reverse proxy every visitor
 	// may share one address.
-	if s.siteAuth.ok(key) {
-		return true
+	if id, ok := s.siteAuth.ok(key); ok {
+		return id, true
 	}
 
+	user, pass, _ := r.BasicAuth()
+	// The throttle is per site, per client address *and per submitted username*.
+	// Without the username, thirty wrong guesses lock out every first-time
+	// visitor to the site — behind a reverse proxy without HOSTR_TRUST_PROXY the
+	// whole audience shares one address, and since a success no longer clears
+	// the counter there would be nothing anyone could do but wait it out.
+	// Guessing one account's password still costs the guesser their budget for
+	// that account, which is the budget that matters; spraying usernames buys
+	// nothing, because on this server a username is itself a secret.
 	ip := s.clientIP(r)
-	tkey := "site:" + site.ID + ":" + ip
+	tkey := "site:" + site.ID + ":" + ip + ":" + sha256hex(user)
 	if s.siteThrottle.blocked(tkey) {
 		return deny(http.StatusTooManyRequests, "429 too many attempts, try again later")
 	}
 
 	s.siteAuth.verify.Lock()
 	defer s.siteAuth.verify.Unlock()
-	if s.siteAuth.ok(key) {
-		return true // another request verified the same credentials while we waited
+	if id, ok := s.siteAuth.ok(key); ok {
+		return id, true // another request verified the same credentials while we waited
 	}
 
-	user, pass, _ := r.BasicAuth()
-	// Both halves are checked every time, with no short-circuit: the username
-	// is half the secret here, and skipping the hash when it is wrong makes it
-	// recoverable by timing alone.
-	userOK := constantTimeEq(user, site.AuthUser)
-	passOK := verifyPassword(site.AuthHash, pass)
-	if !userOK || !passOK {
+	// Every account is compared, without stopping at a hit, and exactly one
+	// argon2 verification runs whether or not anything matched — against a hash
+	// that can never verify when nothing did. A wrong username and a wrong
+	// password therefore cost the same, and neither which accounts exist nor how
+	// many of them there are is recoverable from response timing. Usernames are
+	// unique per site, so at most one account can match.
+	var matched *SiteAccount
+	for _, a := range site.Accounts {
+		if constantTimeEq(user, a.User) {
+			matched = a
+		}
+	}
+	encoded := dummyHash
+	if matched != nil {
+		encoded = matched.Hash
+	}
+	if !verifyPassword(encoded, pass) || matched == nil {
 		s.siteThrottle.fail(tkey)
 		return deny(http.StatusUnauthorized, "401 invalid credentials")
 	}
-	s.siteThrottle.reset(tkey)
-	s.siteAuth.put(key)
-	return true
+	// Success deliberately does *not* clear the failure counter. With several
+	// accounts on one site, whoever holds one valid credential could otherwise
+	// spend the budget guessing at another, present their own to zero it, and
+	// repeat — the throttle guarding everyone else's passwords would never fire.
+	// A verified visitor is already exempt through the memo above, which is all
+	// the reset was ever for.
+	s.siteAuth.put(key, matched.ID)
+	return matched.ID, true
 }
 
 // ---- request authentication ----

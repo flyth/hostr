@@ -96,7 +96,7 @@ func quality(params string) float64 {
 	return 1
 }
 
-func (s *Server) serveMarkdownPage(w http.ResponseWriter, r *http.Request, site *Site, name string) {
+func (s *Server) serveMarkdownPage(w http.ResponseWriter, r *http.Request, domain, name string) {
 	h := w.Header()
 	h.Set("Content-Type", "text/html; charset=utf-8")
 	h.Set("X-Content-Type-Options", "nosniff")
@@ -105,5 +105,5 @@ func (s *Server) serveMarkdownPage(w http.ResponseWriter, r *http.Request, site 
 	if r.Method == http.MethodHead {
 		return
 	}
-	_, _ = w.Write(markdownPage(name, site.Domain))
+	_, _ = w.Write(markdownPage(name, domain))
 }

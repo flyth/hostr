@@ -58,11 +58,17 @@ rather than the proxy's.
 | `HOSTR_ADDR` | `:8080` | listen address |
 | `HOSTR_DATA` | `/data` | blobs, manifests and the metadata file |
 | `HOSTR_ADMIN_DOMAIN` | *(unset)* | domain the control panel answers on. Unset means "any hostname not bound to a site" — convenient locally, sloppy in production |
+| `HOSTR_ALIAS_DOMAIN` | *(unset)* | parent domain for guest links. Unset means the feature is off |
 | `HOSTR_ADMIN_USER` | `admin` | first account, created on an empty store |
 | `HOSTR_ADMIN_PASSWORD` | *(generated)* | printed to the log once if unset |
 | `HOSTR_MAX_UPLOAD` | `104857600` | per-file upload ceiling, bytes |
 | `HOSTR_SECURE_COOKIES` | `true` | set `false` only for local HTTP |
 | `HOSTR_TRUST_PROXY` | `false` | read the client address from `X-Forwarded-For` |
+
+**One-way upgrade.** The first start on an existing store rewrites each site's
+single basic-auth credential into the account list. An older binary reading that
+store would find no credential at all and serve every protected site wide open,
+so keep a copy of `hostr.json` if you might roll back.
 
 ## Adding people
 
@@ -249,26 +255,93 @@ at `/_hostr/fonts/`.
 
 ## Password protection
 
-A site can sit behind a basic auth prompt, pages and listings alike:
+A site can sit behind a basic auth prompt, pages and listings alike. Give each
+person their own account and you can see who has actually been reading:
 
 ```sh
 hostrctl settings -site playground -auth-user guest -auth-password 'something long'
 hostrctl settings -site playground -no-auth
 ```
 
-The password is stored as argon2id like an account password. Verifying it costs
+The CLI speaks the one-credential shorthand, which replaces whatever the site
+has. Once a site has more than one account, `-auth-user` is refused rather than
+silently deleting other people's logins — add and remove accounts individually
+in the panel. `-no-auth` is *not* refused: it says remove the protection, and it
+removes all of it, however many accounts that is.
+
+Each account carries a **label**, and the label is the only part a client ever
+sees. The username stays on the server: it is half of a basic-auth credential,
+and a site record is readable by every collaborator, not just its owner.
+
+Passwords are stored as argon2id like an account password. Verifying one costs
 64 MiB, so a successful check is memoised for an hour rather than repeated for
 every image on a page, and verifications are serialised so one page load cannot
-start forty of them at once. Changing or clearing the password invalidates the
-memo immediately.
+start forty of them at once. Adding an account, removing one or changing any
+password invalidates the whole site's memo immediately. A login attempt runs
+exactly one hash whether or not the username exists, so which accounts a site
+has cannot be read off response timing.
 
 Only *failed* attempts are throttled, per site and per client address, and a
 credential that has already been verified skips the throttle entirely — behind
 a reverse proxy every visitor shares one address, and someone else's guessing
-must not sign them out.
+must not sign them out. Success does not clear the counter: on a site with
+several accounts, whoever holds one valid password could otherwise use it to
+reset the budget between guesses at another.
 
 Basic auth sends the password on every request, base64-encoded and not
 encrypted. Only put it in front of a site that is served over HTTPS.
+
+## Guest links
+
+A guest link is a throwaway hostname serving the same site. Hand one to each
+person and you can tell their visits apart, and revoke one without touching the
+others.
+
+```
+3f9c1a2b7e4d.guest.example.com  ->  the same site as playground.example.com
+```
+
+Set `HOSTR_ALIAS_DOMAIN=guest.example.com` and point a wildcard at the server:
+
+```
+*.guest.example.com {
+    reverse_proxy hostr:8080
+}
+```
+
+The name is generated, never chosen — 48 random bits under that parent. Nothing
+else may claim a name in there: a site created on `<something>.guest.example.com`
+would serve a tenant's own content, and their own password prompt, under a
+hostname people had been told to trust and a certificate that matches.
+
+A guest link grants nothing the main domain does not. A site behind a password
+is behind the same password here, and the prompt, the listing pages and the
+markdown document titles all name the guest hostname rather than the site's real
+one. What the server writes does not give away where the link points — but the
+site's own pages can, and a canonical URL in your `404.html` or a `<link
+rel=canonical>` in your HTML will still say so. That part is yours.
+
+## Traffic
+
+Every request a site serves is counted against the hostname it arrived on —
+the site's own domain, or one guest link — and against the password account that
+opened it. Each carries a hit count, the bytes actually sent, and a first and
+last access. A site's traffic across every hostname is its own plus its guest
+links': an addition, so revoking or resetting one guest link takes its traffic
+out of the total by itself and leaves nothing to reattribute.
+
+Anything refused is not counted — a 401 carries nothing worth attributing, and
+counting it would let a stranger keep the server writing. Bytes are always
+tallied, but the requests a visit makes on its own behalf do not each count as a
+visit: the shared assets under `/_hostr/`, the file browser's own listing feed,
+and the redirect that exists only to add a trailing slash. A 404 does count —
+somebody asked this hostname for something.
+
+Counters move in memory and are written out every ten seconds, and again on a
+clean shutdown; a `kill -9` costs at most the last few seconds of counting. The
+numbers a client reads always come from memory, so they are never stale. Each
+count is one mutex acquisition and a few adds on a request that was about to
+read a file off disk anyway.
 
 ## How a deploy works
 
@@ -309,8 +382,18 @@ manifest is safely in place.
 - Manifest paths are validated against traversal on write *and* the serving
   layer can only reach blobs listed in that site's manifest, so a hostile path
   has nothing to reach even if validation were bypassed.
-- Domains are globally unique; a tenant cannot claim a domain already bound to
-  someone else's site.
+- Domains are globally unique, and guest links share that one namespace; a
+  tenant cannot claim a name already bound to someone else's site or guest link,
+  and a site cannot rename itself onto one.
+- A guest link is a handle, not a credential. It changes nothing about who may
+  read the site — only which visits can be told apart — so a leaked one is worth
+  exactly as much as the site's real domain.
+- The guest-link namespace is reserved: no site may be created or renamed under
+  `HOSTR_ALIAS_DOMAIN`, so a revoked link's name cannot be picked up by another
+  tenant and served to whoever still has the bookmark.
+- A token bound to one site is a full administrator *of that site*: it can add
+  and remove that site's password accounts and guest links, as it could always
+  clear its password. Give an agent a scoped token if it should only move files.
 - Cookie-authenticated state changes require a same-origin `Origin` header.
   Token-authenticated calls skip that check — there is no ambient credential to
   forge.
@@ -331,8 +414,9 @@ manifest is safely in place.
   plain text are served inline there; everything else downloads, and every
   response carries `nosniff` and a sandbox CSP, because rendering a tenant's
   HTML on the admin origin would put it next to the session cookie.
-- Site passwords are argon2id, verified once and then memoised for an hour
-  keyed on the stored hash, so changing one takes effect immediately.
+- Site passwords are argon2id, verified once and then memoised for an hour keyed
+  on a digest of every credential the site holds, so adding, removing or
+  changing any account takes effect immediately.
 - Admins are the server operator, who already has filesystem access to every
   blob, so they can see and delete any site. That is stated rather than
   pretended away.

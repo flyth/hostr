@@ -2,7 +2,18 @@
   import { untrack } from 'svelte';
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
-  import { get, post, patch, del, humanBytes, ago, type Listing, type Site, type Token } from '$lib/api';
+  import {
+    get,
+    post,
+    patch,
+    del,
+    humanBytes,
+    ago,
+    type Listing,
+    type Site,
+    type Stats,
+    type Token,
+  } from '$lib/api';
   import TokenLimits from '$lib/TokenLimits.svelte';
   import { session } from '$lib/session.svelte';
   import { mount as mountBrowser } from '$lib/browser.js';
@@ -16,8 +27,10 @@
   let notice = $state('');
   let domain = $state('');
   let collaborator = $state('');
+  let authName = $state('');
   let authUser = $state('');
   let authPass = $state('');
+  let aliasNote = $state('');
   let tokenScope = $state('');
   let tokenName = $state('');
   let newToken = $state('');
@@ -27,6 +40,38 @@
 
   const canManage = $derived(!!site && (site.mine || !!session.me?.admin));
   const collaborators = $derived(site?.collaborators ?? []);
+  const aliases = $derived(site?.aliases ?? []);
+  const accounts = $derived(site?.accounts ?? []);
+
+  // `site.stats` is the site's own domain and nothing else, so the figure for
+  // every hostname is a sum. Deriving it by subtraction instead would start
+  // lying the moment one guest link was reset or revoked: its traffic would
+  // vanish from the guest side and reappear as main-domain traffic that never
+  // happened.
+  const allTraffic = $derived.by((): Stats => {
+    const own = site?.stats ?? {};
+    return aliases.reduce(
+      (acc, a) => ({
+        count: (acc.count ?? 0) + (a.stats.count ?? 0),
+        bytes: (acc.bytes ?? 0) + (a.stats.bytes ?? 0),
+        first: acc.first,
+        last: acc.last,
+      }),
+      { count: own.count ?? 0, bytes: own.bytes ?? 0, first: own.first, last: own.last },
+    );
+  });
+
+  const hits = (s: Stats) => `${s.count ?? 0} ${(s.count ?? 0) === 1 ? 'hit' : 'hits'}`;
+
+  async function copy(text: string) {
+    error = '';
+    try {
+      await navigator.clipboard.writeText(text);
+      notice = 'Copied.';
+    } catch {
+      notice = text; // clipboard blocked (insecure origin, denied permission)
+    }
+  }
 
   async function load(siteId: string) {
     error = '';
@@ -103,10 +148,14 @@
     try {
       await fn();
       notice = msg;
-      await load(id);
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
     }
+    // Reloaded whether or not it worked. A failure usually means the server
+    // disagrees about what is here — a guest link already revoked in another
+    // tab — and leaving the stale row on screen next to the error makes the
+    // page keep asserting something the server has just denied.
+    await load(id);
   }
 
   const saveDomain = () =>
@@ -115,14 +164,40 @@
   const toggle = (field: 'listing' | 'listing_no_root' | 'markdown' | 'scoped_only', value: boolean) =>
     act(() => patch(`/api/sites/${id}`, { [field]: value }), 'Setting saved.');
 
-  const saveAuth = () =>
+  const addAccount = () =>
     act(async () => {
-      await patch(`/api/sites/${id}`, {
-        auth_user: authUser.trim(),
-        auth_password: authPass,
+      await post(`/api/sites/${id}/accounts`, {
+        name: authName.trim(),
+        user: authUser.trim(),
+        password: authPass,
       });
+      authName = '';
+      authUser = '';
       authPass = '';
-    }, authUser.trim() ? 'Password protection is on.' : 'Password protection removed.');
+    }, 'Account added.');
+
+  const removeAccount = (accountId: string) =>
+    act(() => del(`/api/sites/${id}/accounts/${accountId}`), 'Account removed.');
+
+  const createAlias = () =>
+    act(async () => {
+      await post(`/api/sites/${id}/aliases`, { note: aliasNote.trim() });
+      aliasNote = '';
+    }, 'Guest link created.');
+
+  const removeAlias = (aliasId: string) =>
+    act(() => del(`/api/sites/${id}/aliases/${aliasId}`), 'Guest link removed.');
+
+  const resetAlias = (aliasId: string) =>
+    act(() => post(`/api/sites/${id}/aliases/${aliasId}/reset`), 'Counters reset.');
+
+  const resetAccount = (accountId: string) =>
+    act(() => post(`/api/sites/${id}/accounts/${accountId}/reset`), 'Counters reset.');
+
+  // Resetting the site resets its guest links and accounts with it, so the
+  // implicit main-domain figure cannot end up larger than the total.
+  const resetSite = () =>
+    act(() => post(`/api/sites/${id}/reset`), 'All counters for this site reset.');
 
   const addMember = () =>
     act(async () => {
@@ -319,27 +394,131 @@ hostrctl push   -site {site.slug} -scope my-website render.png</pre>
       </label>
 
       <div class="border-edge border-t pt-4">
-        <span class="text-mute text-xs">Password protection</span>
+        <span class="text-mute text-xs">Password accounts</span>
         <p class="text-mute mb-2 text-xs">
-          A browser prompt in front of every page and listing. Credentials travel in the clear
-          unless the site is served over HTTPS.
+          A browser prompt in front of every page and listing. Give each person their own account
+          and you can see who has been reading. Credentials travel in the clear unless the site is
+          served over HTTPS.
         </p>
+        <ul class="mb-2 space-y-1">
+          {#each accounts as account (account.id)}
+            <li class="border-edge flex flex-wrap items-center justify-between gap-2 border-t pt-2 text-sm">
+              <span class="min-w-0">
+                {account.name}
+                <span class="text-mute block text-xs">
+                  {hits(account.stats)} · {humanBytes(account.stats.bytes ?? 0)} · first {ago(
+                    account.stats.first,
+                  )} · last {ago(account.stats.last)}
+                </span>
+              </span>
+              <span class="flex shrink-0 gap-2">
+                <button class="btn text-xs" onclick={() => resetAccount(account.id)}>Reset</button>
+                <button class="btn btn-danger text-xs" onclick={() => removeAccount(account.id)}>
+                  Remove
+                </button>
+              </span>
+            </li>
+          {:else}
+            <li class="text-mute text-sm">None — the site is public.</li>
+          {/each}
+        </ul>
         <div class="flex flex-wrap gap-2">
+          <input class="input-field flex-1" bind:value={authName} placeholder="label, e.g. anna" />
           <input class="input-field flex-1" bind:value={authUser} placeholder="username" />
           <input
             class="input-field flex-1"
             type="password"
             bind:value={authPass}
-            placeholder={site.protected ? 'new password' : 'password'}
+            placeholder="password"
           />
-          <button class="btn" onclick={saveAuth} disabled={!!authUser.trim() && !authPass}>
-            {authUser.trim() ? 'Save' : 'Remove'}
+          <button
+            class="btn"
+            onclick={addAccount}
+            disabled={!authName.trim() || !authUser.trim() || !authPass}
+          >
+            Add
           </button>
         </div>
         <p class="text-mute mt-1 text-xs">
-          {site.protected
-            ? 'Currently protected. The username is not shown here — it is half the credential, so it stays on the server. Re-enter both to change them.'
-            : 'Currently public.'} Clear the username and save to remove protection.
+          Usernames are not listed here — a username is half of a basic-auth credential, so it
+          stays on the server. The label is what you see. Removing the last account makes the site
+          public again.
+        </p>
+      </div>
+
+      <div class="border-edge border-t pt-4">
+        <span class="text-mute text-xs">Guest links</span>
+        <p class="text-mute mb-2 text-xs">
+          A throwaway hostname serving this same site. Hand one to each person and you can tell
+          their visits apart, and take a single link away without touching the others. A guest link
+          grants nothing extra: a site behind a password is behind it here too.
+        </p>
+        <ul class="mb-2 space-y-1">
+          {#each aliases as alias (alias.id)}
+            <li class="border-edge flex flex-wrap items-center justify-between gap-2 border-t pt-2 text-sm">
+              <span class="min-w-0">
+                <a
+                  href="https://{alias.domain}"
+                  class="hover:text-accent font-mono break-all"
+                  rel="noreferrer">{alias.domain}</a
+                >
+                {#if alias.note}<span class="text-mute">· {alias.note}</span>{/if}
+                <span class="text-mute block text-xs">
+                  {hits(alias.stats)} · {humanBytes(alias.stats.bytes ?? 0)} · first {ago(
+                    alias.stats.first,
+                  )} · last {ago(alias.stats.last)}
+                </span>
+              </span>
+              <span class="flex shrink-0 gap-2">
+                <button class="btn text-xs" onclick={() => copy(`https://${alias.domain}`)}>
+                  Copy
+                </button>
+                <button class="btn text-xs" onclick={() => resetAlias(alias.id)}>Reset</button>
+                <button class="btn btn-danger text-xs" onclick={() => removeAlias(alias.id)}>
+                  Remove
+                </button>
+              </span>
+            </li>
+          {:else}
+            <li class="text-mute text-sm">None.</li>
+          {/each}
+        </ul>
+        <div class="flex flex-wrap gap-2">
+          <input
+            class="input-field flex-1"
+            bind:value={aliasNote}
+            placeholder="who is this for? (optional)"
+          />
+          <button class="btn" onclick={createAlias}>Create guest link</button>
+        </div>
+      </div>
+
+      <div class="border-edge border-t pt-4">
+        <span class="text-mute text-xs">Traffic</span>
+        <p class="text-mute mb-2 text-xs">
+          Requests served and bytes sent, counted after any password prompt. Counters are held in
+          memory and written out every few seconds, so a hard restart can lose the last of them.
+        </p>
+        <ul class="space-y-1 text-sm">
+          <li class="flex flex-wrap items-baseline justify-between gap-2">
+            <span>All hostnames</span>
+            <span class="text-mute text-xs">
+              {hits(allTraffic)} · {humanBytes(allTraffic.bytes ?? 0)}
+            </span>
+          </li>
+          <li class="flex flex-wrap items-baseline justify-between gap-2">
+            <span class="font-mono">{site.domain}</span>
+            <span class="text-mute text-xs">
+              {hits(site.stats)} · {humanBytes(site.stats.bytes ?? 0)} · first {ago(
+                site.stats.first,
+              )} · last {ago(site.stats.last)}
+            </span>
+          </li>
+        </ul>
+        <button class="btn mt-3 text-xs" onclick={resetSite}>Reset all counters</button>
+        <p class="text-mute mt-1 text-xs">
+          This zeroes the guest links and the accounts too. Each one on its own can be reset from
+          its own row.
         </p>
       </div>
 

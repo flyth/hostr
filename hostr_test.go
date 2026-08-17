@@ -24,12 +24,12 @@ import (
 func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := openDB(dir + "/hostr.json")
+	db, err := openDB(dir+"/hostr.json", "guest.test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	s := &Server{
-		cfg:          Config{Data: dir, AdminDomain: "admin.test", MaxUpload: 1 << 20},
+		cfg:          Config{Data: dir, AdminDomain: "admin.test", AliasDomain: "guest.test", MaxUpload: 1 << 20},
 		db:           db,
 		storage:      newStorage(dir),
 		sessions:     newSessions(),
