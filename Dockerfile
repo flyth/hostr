@@ -11,7 +11,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # 2. Build the static binaries with the panel embedded.
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 # mailcap supplies /etc/mime.types; Go's built-in table misses .woff2, .ico and
 # friends, which a static site will absolutely serve.
 RUN apk add --no-cache mailcap
