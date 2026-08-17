@@ -35,6 +35,25 @@ export const del = <T>(p: string) => api<T>(p, { method: 'DELETE' });
 
 export type Me = { id: string; name: string; admin: boolean; created: string };
 
+/** Traffic carried by a site, a guest link or a password account. `count` and
+ *  `bytes` are absent rather than zero until something has actually been
+ *  served. */
+export type Stats = { count?: number; bytes?: number; first?: string; last?: string };
+
+/** A guest link: a second hostname serving the same site, handed to one person
+ *  so their visits can be told from everyone else's. */
+export type Alias = {
+  id: string;
+  domain: string;
+  note?: string;
+  created: string;
+  stats: Stats;
+};
+
+/** A basic-auth account in front of a site. The username never leaves the
+ *  server — it is half of the credential — so the label identifies it here. */
+export type SiteAccount = { id: string; name: string; created: string; stats: Stats };
+
 export type Site = {
   id: string;
   slug: string;
@@ -53,9 +72,15 @@ export type Site = {
   listing_no_root: boolean;
   markdown: boolean;
   scoped_only: boolean;
-  /** Whether basic auth is set. The username never leaves the server — it is
-   *  half of that credential. */
+  /** Whether any basic auth account exists. */
   protected: boolean;
+  accounts: SiteAccount[];
+  /** Absent for a scoped token, which is told nothing about the site beyond
+   *  its own subtrees. */
+  aliases?: Alias[];
+  /** Every hostname the site answers on. Main-domain traffic is this minus the
+   *  guest links'. */
+  stats: Stats;
 };
 
 export type Token = {

@@ -20,10 +20,22 @@ type collaborator struct {
 	Name string `json:"name"`
 }
 
+// accountView is a site password account as a client may see it. Neither the
+// username nor the hash appears: the username is half of a basic-auth
+// credential, and a site record is readable by every collaborator, not only its
+// owner. The label is what identifies an account in the panel instead.
+type accountView struct {
+	ID      string    `json:"id"`
+	Name    string    `json:"name"`
+	Created time.Time `json:"created"`
+	Stats   Stats     `json:"stats"`
+}
+
 type siteView struct {
-	// The embedded site is a copy with its password hash cleared; see view.
+	// The embedded site is a copy with its credentials cleared; see view.
 	*Site
 	Protected     bool           `json:"protected"`
+	Accounts      []accountView  `json:"accounts"`
 	OwnerName     string         `json:"owner_name"`
 	Collaborators []collaborator `json:"collaborators"`
 	Files         int            `json:"files"`
@@ -55,13 +67,28 @@ func (s *Server) view(c caller, site *Site) siteView {
 	// The view embeds the site wholesale, so secrets are stripped from a copy
 	// rather than suppressed with a tag — a field added to Site later inherits
 	// the safe default of being visible, and a secret one has to be cleared
-	// here on purpose. The basic-auth username goes too: it is half of that
-	// credential, and `protected` is all a client needs to render.
+	// here on purpose. The accounts go out through accountView instead, so the
+	// type that carries a username and a hash is never the one being encoded.
 	safe := site.clone()
 	safe.AuthHash = ""
 	safe.AuthUser = ""
+	safe.Accounts = nil
+	accounts := []accountView{}
+	if c.scoped() {
+		// Same rule as the file counts above: a scoped token learns nothing
+		// about the site beyond its own subtrees — not who can open it, not who
+		// has been handed a link to it, and not how much traffic the rest of the
+		// site carries.
+		safe.Aliases = nil
+		safe.Stats = Stats{}
+	} else {
+		for _, a := range site.Accounts {
+			accounts = append(accounts, accountView{ID: a.ID, Name: a.Name, Created: a.Created, Stats: a.Stats})
+		}
+	}
 	return siteView{
-		Site: safe, Protected: site.AuthUser != "", OwnerName: owner, Collaborators: members,
+		Site: safe, Protected: len(site.Accounts) > 0, Accounts: accounts,
+		OwnerName: owner, Collaborators: members,
 		Files: len(m.Files), Bytes: m.Usage(), Version: m.Version, Deployed: m.Updated,
 		Mine: site.Owner == u.ID,
 	}
@@ -91,6 +118,14 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/sites/{id}/deploy", s.siteFiles(s.handleDeploy))
 	mux.HandleFunc("POST /api/sites/{id}/members", s.site(s.handleAddMember))
 	mux.HandleFunc("DELETE /api/sites/{id}/members/{user}", s.site(s.handleRemoveMember))
+
+	mux.HandleFunc("POST /api/sites/{id}/aliases", s.site(s.handleCreateAlias))
+	mux.HandleFunc("DELETE /api/sites/{id}/aliases/{alias}", s.site(s.handleDeleteAlias))
+	mux.HandleFunc("POST /api/sites/{id}/aliases/{alias}/reset", s.site(s.handleResetAlias))
+	mux.HandleFunc("POST /api/sites/{id}/accounts", s.site(s.handleCreateAccount))
+	mux.HandleFunc("DELETE /api/sites/{id}/accounts/{account}", s.site(s.handleDeleteAccount))
+	mux.HandleFunc("POST /api/sites/{id}/accounts/{account}/reset", s.site(s.handleResetAccount))
+	mux.HandleFunc("POST /api/sites/{id}/reset", s.site(s.handleResetSite))
 
 	mux.HandleFunc("GET /api/tokens", s.auth(s.handleListTokens))
 	mux.HandleFunc("POST /api/tokens", s.auth(s.handleCreateToken))
@@ -234,6 +269,17 @@ func (s *Server) siteGate(l access, next siteHandler) http.HandlerFunc {
 
 // ---- helpers ----
 
+// requireOwner gates the site changes a collaborator may not make. Deploying is
+// shared; deciding who can reach the site, what it is called and whether it
+// continues to exist is not. It answers the request itself when it says no.
+func requireOwner(w http.ResponseWriter, c caller, site *Site, what string) bool {
+	if site.Owner == c.user.ID || c.user.Admin {
+		return true
+	}
+	writeErr(w, http.StatusForbidden, "only the owner can "+what)
+	return false
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -269,11 +315,26 @@ func writeStoreErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, errNotFound):
 		writeErr(w, http.StatusNotFound, "not found")
+	case errors.Is(err, errManyAccounts):
+		writeErr(w, http.StatusConflict, err.Error())
 	case errors.Is(err, errConflict):
 		writeErr(w, http.StatusConflict, "already exists")
 	default:
 		writeErr(w, http.StatusBadRequest, err.Error())
 	}
+}
+
+// writeSite re-reads a site and renders it as the response. Reading it back is
+// the point — the caller has just changed it — and so is the nil check: a site
+// the owner deleted from another tab while this request was in flight is a 404,
+// not a panic halfway through rendering it.
+func (s *Server) writeSite(w http.ResponseWriter, c caller, id string) {
+	site := s.db.Site(id)
+	if site == nil {
+		writeErr(w, http.StatusNotFound, "no such site")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.view(c, site))
 }
 
 // dummyHash lets a login against an unknown username burn the same argon2 time
@@ -415,9 +476,7 @@ func (s *Server) handleGetSite(w http.ResponseWriter, r *http.Request, c caller,
 // field is optional and a nil pointer means "leave this alone", so the panel
 // can flip one toggle without resending the rest.
 func (s *Server) handlePatchSite(w http.ResponseWriter, r *http.Request, c caller, site *Site) {
-	u := c.user
-	if site.Owner != u.ID && !u.Admin {
-		writeErr(w, http.StatusForbidden, "only the owner can change site settings")
+	if !requireOwner(w, c, site, "change site settings") {
 		return
 	}
 	var req struct {
@@ -447,6 +506,16 @@ func (s *Server) handlePatchSite(w http.ResponseWriter, r *http.Request, c calle
 		}
 	}
 	if req.AuthUser != nil && strings.TrimSpace(*req.AuthUser) != "" {
+		// This field is the one-credential shorthand, and it replaces whatever
+		// the site has. On a site with several accounts that would quietly
+		// delete other people's logins, so it is refused rather than obeyed —
+		// here, so a rejected patch applies none of its other halves either, and
+		// again inside the store under the write lock, where the count cannot
+		// change underneath the check.
+		if len(site.Accounts) > 1 {
+			writeErr(w, http.StatusConflict, errManyAccounts.Error())
+			return
+		}
 		pass := ""
 		if req.AuthPass != nil {
 			pass = *req.AuthPass
@@ -485,13 +554,11 @@ func (s *Server) handlePatchSite(w http.ResponseWriter, r *http.Request, c calle
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, s.view(c, s.db.Site(site.ID)))
+	s.writeSite(w, c, site.ID)
 }
 
 func (s *Server) handleDeleteSite(w http.ResponseWriter, r *http.Request, c caller, site *Site) {
-	u := c.user
-	if site.Owner != u.ID && !u.Admin {
-		writeErr(w, http.StatusForbidden, "only the owner can delete a site")
+	if !requireOwner(w, c, site, "delete a site") {
 		return
 	}
 	if err := s.db.DeleteSite(site.ID); err != nil {
@@ -798,9 +865,7 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request, c caller, 
 }
 
 func (s *Server) handleAddMember(w http.ResponseWriter, r *http.Request, c caller, site *Site) {
-	u := c.user
-	if site.Owner != u.ID && !u.Admin {
-		writeErr(w, http.StatusForbidden, "only the owner can manage collaborators")
+	if !requireOwner(w, c, site, "manage collaborators") {
 		return
 	}
 	var req struct{ Name string }
@@ -816,7 +881,7 @@ func (s *Server) handleAddMember(w http.ResponseWriter, r *http.Request, c calle
 		writeStoreErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.view(c, s.db.Site(site.ID)))
+	s.writeSite(w, c, site.ID)
 }
 
 func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request, c caller, site *Site) {
@@ -832,6 +897,111 @@ func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request, c ca
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// ---- guest links, site accounts and their counters ----
+
+// handleCreateAlias mints a guest link. The domain is generated, never chosen:
+// a caller-supplied one would be a second custom-domain feature wearing a guest
+// link's clothes, and it is the whole of the surface on which one tenant could
+// try to claim a name another tenant answers on.
+//
+// ponytail: if a vanity guest domain is ever actually wanted, it goes through
+// the same uniqueness walk CreateSite uses and needs the admin domain refused
+// alongside it — the check is already written, only the input is missing.
+func (s *Server) handleCreateAlias(w http.ResponseWriter, r *http.Request, c caller, site *Site) {
+	if !requireOwner(w, c, site, "hand out guest links") {
+		return
+	}
+	var req struct {
+		Note string `json:"note"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	if s.cfg.AliasDomain == "" {
+		writeErr(w, http.StatusNotImplemented,
+			"guest links need HOSTR_ALIAS_DOMAIN set on the server, with a wildcard record pointing at it")
+		return
+	}
+	a, err := s.db.CreateAlias(site.ID, s.cfg.AdminDomain, req.Note)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	s.log.Printf("guest link %s for site=%s by=%s", a.Domain, site.Slug, c.user.Name)
+	writeJSON(w, http.StatusCreated, a)
+}
+
+func (s *Server) handleDeleteAlias(w http.ResponseWriter, r *http.Request, c caller, site *Site) {
+	if !requireOwner(w, c, site, "remove guest links") {
+		return
+	}
+	if err := s.db.DeleteAlias(site.ID, r.PathValue("alias")); err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request, c caller, site *Site) {
+	if !requireOwner(w, c, site, "manage site passwords") {
+		return
+	}
+	var req struct {
+		Name     string `json:"name"`
+		User     string `json:"user"`
+		Password string `json:"password"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	a, err := s.db.CreateAccount(site.ID, req.Name, req.User, req.Password)
+	if err != nil {
+		if errors.Is(err, errConflict) {
+			writeErr(w, http.StatusConflict, "this site already has an account with that username")
+			return
+		}
+		writeStoreErr(w, err)
+		return
+	}
+	// The username is deliberately not echoed, for the same reason it is not in
+	// the site view: it is half of the credential the caller just set.
+	writeJSON(w, http.StatusCreated, accountView{ID: a.ID, Name: a.Name, Created: a.Created})
+}
+
+func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request, c caller, site *Site) {
+	if !requireOwner(w, c, site, "manage site passwords") {
+		return
+	}
+	if err := s.db.DeleteAccount(site.ID, r.PathValue("account")); err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleResetAlias(w http.ResponseWriter, r *http.Request, c caller, site *Site) {
+	s.resetStats(w, c, site, "alias", r.PathValue("alias"))
+}
+
+func (s *Server) handleResetAccount(w http.ResponseWriter, r *http.Request, c caller, site *Site) {
+	s.resetStats(w, c, site, "account", r.PathValue("account"))
+}
+
+func (s *Server) handleResetSite(w http.ResponseWriter, r *http.Request, c caller, site *Site) {
+	s.resetStats(w, c, site, "site", "")
+}
+
+func (s *Server) resetStats(w http.ResponseWriter, c caller, site *Site, kind, id string) {
+	if !requireOwner(w, c, site, "reset traffic counters") {
+		return
+	}
+	if err := s.db.ResetStats(site.ID, kind, id); err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	s.writeSite(w, c, site.ID)
 }
 
 // ---- tokens ----

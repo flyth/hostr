@@ -25,6 +25,58 @@ type User struct {
 	Created time.Time `json:"created"`
 }
 
+// Stats is the traffic a site, a guest link or a password account has carried.
+// Count is requests, Bytes is response bodies that actually went out. First and
+// last answer the only question anyone really asks of a link they handed over:
+// was it ever opened, and is it still being opened.
+type Stats struct {
+	Count int64     `json:"count,omitempty"`
+	Bytes int64     `json:"bytes,omitempty"`
+	First time.Time `json:"first,omitzero"`
+	Last  time.Time `json:"last,omitzero"`
+}
+
+// hit folds one request into the counters. counted=false is for the requests a
+// visit makes on its own behalf — the fonts, the stylesheet, the redirect that
+// only exists to add a trailing slash. Their bytes are real traffic and count;
+// they are not separate visits, so they move neither the hit count nor the
+// first/last timestamps, which exist to answer "was this opened, and when".
+func (s *Stats) hit(now time.Time, n int64, counted bool) {
+	s.Bytes += n
+	if !counted {
+		return
+	}
+	s.Count++
+	if s.First.IsZero() {
+		s.First = now
+	}
+	s.Last = now
+}
+
+// Alias is a guest link: a second hostname serving the same site, meant to be
+// handed to one person so that what they do with it can be told apart from
+// everyone else. It grants nothing the main domain does not — a site behind a
+// password is still behind that password on every alias.
+type Alias struct {
+	ID      string    `json:"id"`
+	Domain  string    `json:"domain"`
+	Note    string    `json:"note,omitempty"` // who you gave it to
+	Created time.Time `json:"created"`
+	Stats   Stats     `json:"stats"`
+}
+
+// SiteAccount is one basic-auth credential in front of a site. Name is a label
+// for the owner's benefit and the only part a client ever sees: the username is
+// half of the credential, and a site record is readable by every collaborator.
+type SiteAccount struct {
+	ID      string    `json:"id"`
+	Name    string    `json:"name"`
+	User    string    `json:"user"` // never leaves the server
+	Hash    string    `json:"hash"` // argon2id, never leaves the server
+	Created time.Time `json:"created"`
+	Stats   Stats     `json:"stats"`
+}
+
 type Site struct {
 	ID      string    `json:"id"`
 	Slug    string    `json:"slug"`
@@ -55,8 +107,22 @@ type Site struct {
 	// and remains allowed.
 	ScopedOnly bool `json:"scoped_only"`
 
-	// Basic auth in front of the served site. AuthHash is argon2id like a user
-	// password and must never leave the server; siteView shadows it.
+	// Aliases are the guest links pointing at this site, Accounts the basic-auth
+	// credentials in front of it. Both live inside the site rather than in a
+	// top-level map so that deleting a site takes them with it.
+	Aliases  []*Alias       `json:"aliases,omitempty"`
+	Accounts []*SiteAccount `json:"accounts,omitempty"`
+
+	// Stats is the traffic that arrived on the site's *own* domain. Each guest
+	// link keeps its own, so the total across every hostname is this plus
+	// theirs — an addition, deliberately, rather than a site-wide total to
+	// subtract from. Revoking or resetting one guest link then takes its traffic
+	// out of the total by itself, with no second counter to keep in step.
+	Stats Stats `json:"stats"`
+
+	// The single basic-auth credential sites used to carry. Kept only so an
+	// existing store still parses: openDB folds it into Accounts and clears it,
+	// after which `omitempty` keeps it out of the file for good.
 	AuthUser string `json:"auth_user,omitempty"`
 	AuthHash string `json:"auth_hash,omitempty"`
 }
@@ -100,15 +166,28 @@ type DB struct {
 	mu   sync.RWMutex
 	path string
 	d    data
+	// aliasBase is the parent of every guest link. The store needs it to keep
+	// that namespace closed: only CreateAlias may mint a name under it.
+	aliasBase string
+	// dirty marks a change that is not on disk yet — counters that have moved,
+	// or a mutation whose write failed. Traffic accounting deliberately does not
+	// write per request; see stats.go.
+	dirty bool
 }
 
 var (
 	errNotFound = errors.New("not found")
 	errConflict = errors.New("already exists")
+	// errManyAccounts refuses the one-credential shorthand on a site that has
+	// several, where obeying it would delete logins the caller never named.
+	errManyAccounts = errors.New("this site has more than one password account; add and remove them individually")
 )
 
-func openDB(path string) (*DB, error) {
-	db := &DB{path: path, d: data{
+// openDB loads the store. aliasDomain is the parent guest links hang under, or
+// empty when the feature is off; the store holds it because it is the store
+// that has to refuse anyone else claiming a name in there.
+func openDB(path, aliasDomain string) (*DB, error) {
+	db := &DB{path: path, aliasBase: normDomain(aliasDomain), d: data{
 		Users:   map[string]*User{},
 		Sites:   map[string]*Site{},
 		Tokens:  map[string]*Token{},
@@ -136,11 +215,49 @@ func openDB(path string) (*DB, error) {
 	if db.d.Invites == nil {
 		db.d.Invites = map[string]*Invite{}
 	}
+	if db.migrateAuth() {
+		// Written back straight away so the file matches what the server is
+		// serving from. A store that has been through this cannot be read by an
+		// older binary — it would see no `auth_user` and serve every protected
+		// site wide open — so the migration is one way on purpose.
+		db.mu.Lock()
+		err := db.save()
+		db.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+	}
 	return db, nil
+}
+
+// migrateAuth folds the single basic-auth credential a site used to carry into
+// the account list, and reports whether anything moved.
+func (db *DB) migrateAuth() bool {
+	moved := false
+	for _, s := range db.d.Sites {
+		if s.AuthUser == "" && s.AuthHash == "" {
+			continue
+		}
+		if s.AuthUser != "" && s.AuthHash != "" && len(s.Accounts) == 0 {
+			s.Accounts = []*SiteAccount{{
+				ID: randHex(8), Name: "default",
+				User: s.AuthUser, Hash: s.AuthHash, Created: s.Created,
+			}}
+		}
+		s.AuthUser, s.AuthHash = "", ""
+		moved = true
+	}
+	return moved
 }
 
 // save writes the whole store atomically. Callers must hold the write lock.
 func (db *DB) save() error {
+	// Marked before the write, not after: a mutation whose write fails is live
+	// in memory and missing from disk, and the flush timer is what gets it
+	// there. Clearing this only on success is what makes a transient ENOSPC
+	// heal itself instead of leaving the server enforcing rules the file has
+	// never heard of.
+	db.dirty = true
 	b, err := json.MarshalIndent(db.d, "", "  ")
 	if err != nil {
 		return err
@@ -149,7 +266,11 @@ func (db *DB) save() error {
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, db.path)
+	if err := os.Rename(tmp, db.path); err != nil {
+		return err
+	}
+	db.dirty = false
+	return nil
 }
 
 func randHex(n int) string {
@@ -400,6 +521,48 @@ func normDomain(s string) string {
 	return strings.TrimSuffix(s, ".")
 }
 
+// reservedDomain reports whether a hostname belongs to the guest-link
+// namespace, which only CreateAlias may mint into. Without this any tenant could
+// create a site on a name shaped exactly like a guest link and serve their own
+// content — their own password prompt, even — under the operator's wildcard
+// certificate. Worse, a revoked guest link's name is free the instant it is
+// deleted, so whoever grabs it inherits everyone still holding that bookmark.
+func (db *DB) reservedDomain(domain string) bool {
+	if db.aliasBase == "" {
+		return false
+	}
+	return domain == db.aliasBase || strings.HasSuffix(domain, "."+db.aliasBase)
+}
+
+// domainClaimed reports whether a hostname is already in use, by a site's own
+// domain or by anybody's guest link. The two share one namespace on purpose:
+// they resolve the same way, so letting a site claim a name an alias already
+// answers on — or the reverse — would hand one tenant another tenant's traffic.
+// exceptSite is the site being renamed, which may of course keep its own name.
+// Callers hold at least the read lock.
+func (db *DB) domainClaimed(domain, exceptSite string) bool {
+	for _, s := range db.d.Sites {
+		if s.ID != exceptSite && s.Domain == domain {
+			return true
+		}
+		// A site's own aliases still block its rename: two names resolving to
+		// the same site is fine, but the same name meaning two things is not.
+		for _, a := range s.Aliases {
+			if a.Domain == domain {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// domainTaken is what every path but guest-link minting asks: is this name
+// unavailable, either because something already answers on it or because it is
+// not ours to hand out.
+func (db *DB) domainTaken(domain, exceptSite string) bool {
+	return db.reservedDomain(domain) || db.domainClaimed(domain, exceptSite)
+}
+
 func (db *DB) CreateSite(owner, slug, domain string) (*Site, error) {
 	slug = strings.ToLower(strings.TrimSpace(slug))
 	domain = normDomain(domain)
@@ -411,12 +574,10 @@ func (db *DB) CreateSite(owner, slug, domain string) (*Site, error) {
 	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	if db.domainTaken(domain, "") {
+		return nil, errConflict
+	}
 	for _, s := range db.d.Sites {
-		// Domains are globally unique: without this any tenant could claim a
-		// domain already bound to someone else's site and take over its traffic.
-		if s.Domain == domain {
-			return nil, errConflict
-		}
 		if s.Owner == owner && s.Slug == slug {
 			return nil, errConflict
 		}
@@ -435,15 +596,26 @@ func (db *DB) Site(id string) *Site {
 	return nil
 }
 
-func (db *DB) SiteByDomain(domain string) *Site {
+// Resolve maps a hostname onto the site that answers on it, plus the guest link
+// it arrived through when it was not the site's own domain. Site domains are
+// matched first so a guest link can never shadow the real one, even though
+// domainTaken already makes that collision impossible to create.
+func (db *DB) Resolve(domain string) (*Site, *Alias) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	for _, s := range db.d.Sites {
 		if s.Domain == domain {
-			return s.clone()
+			return s.clone(), nil
 		}
 	}
-	return nil
+	for _, s := range db.d.Sites {
+		for _, a := range s.Aliases {
+			if a.Domain == domain {
+				return s.clone(), a.clone()
+			}
+		}
+	}
+	return nil, nil
 }
 
 // SitesFor returns the sites a user may deploy to and read.
@@ -470,10 +642,8 @@ func (db *DB) SetDomain(id, domain string) error {
 	if !ok {
 		return errNotFound
 	}
-	for _, o := range db.d.Sites {
-		if o.ID != id && o.Domain == domain {
-			return errConflict
-		}
+	if db.domainTaken(domain, id) {
+		return errConflict
 	}
 	s.Domain = domain
 	return db.save()
@@ -569,6 +739,13 @@ func (db *DB) SetSiteSettings(id string, set siteSettings) error {
 // checkSiteCredentials validates a basic-auth pair without doing the expensive
 // part, so a caller can reject a bad request before committing anything else.
 func checkSiteCredentials(user, password string) error {
+	// An empty username is not a credential. It also collides with the
+	// one-credential shorthand, where an empty user means "remove protection",
+	// and it matches every unparseable Authorization header, since comparing two
+	// empty strings succeeds.
+	if user == "" {
+		return errors.New("site username cannot be empty")
+	}
 	// A colon can never survive the round trip: basic auth joins the two
 	// halves with one and the client splits on the first, so such a username
 	// would leave the site permanently unopenable.
@@ -593,16 +770,17 @@ func (db *DB) CheckDomain(id, domain string) error {
 	if _, ok := db.d.Sites[id]; !ok {
 		return errNotFound
 	}
-	for _, o := range db.d.Sites {
-		if o.ID != id && o.Domain == domain {
-			return errConflict
-		}
+	if db.domainTaken(domain, id) {
+		return errConflict
 	}
 	return nil
 }
 
-// SetSiteAuth sets or clears the basic-auth credentials in front of a site. An
-// empty user removes protection; anything else needs both halves.
+// SetSiteAuth is the one-credential path the CLI and the old API speak: it
+// replaces whatever accounts a site has with a single one, and an empty user
+// removes protection entirely. Callers must refuse it on a site with more than
+// one account — silently deleting other people's logins is not a settings
+// change. The multi-account API is CreateAccount/DeleteAccount.
 func (db *DB) SetSiteAuth(id, user, password string) error {
 	user = strings.TrimSpace(user)
 	hash := ""
@@ -621,7 +799,190 @@ func (db *DB) SetSiteAuth(id, user, password string) error {
 	if !ok {
 		return errNotFound
 	}
-	s.AuthUser, s.AuthHash = user, hash
+	if user == "" {
+		s.Accounts = nil
+		return db.save()
+	}
+	// Re-checked here, under the write lock, and not only in the handler: the
+	// handler works from a snapshot taken before the request body was read, and
+	// an account added in that window would be deleted by a call that was
+	// supposed to be refused.
+	if len(s.Accounts) > 1 {
+		return errManyAccounts
+	}
+	acc := &SiteAccount{ID: randHex(8), Name: "default", User: user, Hash: hash, Created: time.Now().UTC()}
+	if len(s.Accounts) == 1 && s.Accounts[0].User == user {
+		// A new password for the same login is a password change, not a new
+		// account, so it keeps the counters that login has already earned.
+		acc = s.Accounts[0]
+		acc.Hash = hash
+	}
+	s.Accounts = []*SiteAccount{acc}
+	return db.save()
+}
+
+// ---- guest links and site accounts ----
+
+// Caps, not policy. A site with a thousand guest links is a script that got
+// away from someone, and every one of them is scanned on each request.
+const (
+	maxAliases  = 100
+	maxAccounts = 32
+	maxNote     = 200
+	maxLabel    = 64
+)
+
+// CreateAlias mints a guest link: a random name under the server's alias
+// domain, serving this site. The name is generated and claimed inside one
+// critical section, so two requests racing cannot both take it. reserved is the
+// control panel's own domain, which nothing may ever shadow.
+func (db *DB) CreateAlias(siteID, reserved, note string) (*Alias, error) {
+	note = strings.TrimSpace(note)
+	if len(note) > maxNote {
+		return nil, errors.New("note must be at most 200 characters")
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	// The same value the namespace is reserved against, read from the same
+	// place, so the two can never disagree about what a guest link looks like.
+	base := db.aliasBase
+	if base == "" {
+		return nil, errors.New("guest links are not configured on this server")
+	}
+	s, ok := db.d.Sites[siteID]
+	if !ok {
+		return nil, errNotFound
+	}
+	if len(s.Aliases) >= maxAliases {
+		return nil, errors.New("this site already has the maximum number of guest links")
+	}
+	// 48 random bits under a domain nobody enumerates. A retry loop rather than
+	// bare trust because the check is one map walk and a silent collision would
+	// hand someone else's guest another tenant's site.
+	for range 8 {
+		domain := randHex(6) + "." + base
+		if len(domain) > 253 || !domainRe.MatchString(domain) {
+			return nil, errors.New("invalid guest domain: " + domain)
+		}
+		// domainClaimed, not domainTaken: this is the one caller allowed to mint
+		// inside the guest namespace.
+		if domain == reserved || db.domainClaimed(domain, "") {
+			continue
+		}
+		a := &Alias{ID: randHex(8), Domain: domain, Note: note, Created: time.Now().UTC()}
+		s.Aliases = append(s.Aliases, a)
+		return a.clone(), db.save()
+	}
+	return nil, errors.New("could not allocate a free guest domain")
+}
+
+func (db *DB) DeleteAlias(siteID, aliasID string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	s, ok := db.d.Sites[siteID]
+	if !ok {
+		return errNotFound
+	}
+	for i, a := range s.Aliases {
+		if a.ID == aliasID {
+			s.Aliases = append(s.Aliases[:i], s.Aliases[i+1:]...)
+			return db.save()
+		}
+	}
+	return errNotFound
+}
+
+// CreateAccount adds one basic-auth credential to a site. Usernames are unique
+// within a site: basic auth identifies a caller by username alone, so a
+// duplicate would be permanently unreachable and its counters would never move
+// — a silent failure rather than an error.
+func (db *DB) CreateAccount(siteID, name, user, password string) (*SiteAccount, error) {
+	name = strings.TrimSpace(name)
+	user = strings.TrimSpace(user)
+	if name == "" || len(name) > maxLabel {
+		return nil, errors.New("label must be 1-64 characters")
+	}
+	if err := checkSiteCredentials(user, password); err != nil {
+		return nil, err
+	}
+	hash, err := hashPassword(password)
+	if err != nil {
+		return nil, err
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	s, ok := db.d.Sites[siteID]
+	if !ok {
+		return nil, errNotFound
+	}
+	if len(s.Accounts) >= maxAccounts {
+		return nil, errors.New("this site already has the maximum number of accounts")
+	}
+	for _, a := range s.Accounts {
+		if a.User == user {
+			return nil, errConflict
+		}
+	}
+	a := &SiteAccount{ID: randHex(8), Name: name, User: user, Hash: hash, Created: time.Now().UTC()}
+	s.Accounts = append(s.Accounts, a)
+	return a.clone(), db.save()
+}
+
+func (db *DB) DeleteAccount(siteID, accountID string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	s, ok := db.d.Sites[siteID]
+	if !ok {
+		return errNotFound
+	}
+	for i, a := range s.Accounts {
+		if a.ID == accountID {
+			s.Accounts = append(s.Accounts[:i], s.Accounts[i+1:]...)
+			return db.save()
+		}
+	}
+	return errNotFound
+}
+
+// ResetStats zeroes one set of counters. Resetting the site zeroes its guest
+// links and accounts too: main-domain traffic is read as the site total minus
+// the aliases', and that subtraction stops meaning anything — and can go
+// negative on screen — the moment the two are zeroed at different times.
+func (db *DB) ResetStats(siteID, kind, id string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	s, ok := db.d.Sites[siteID]
+	if !ok {
+		return errNotFound
+	}
+	switch kind {
+	case "site":
+		s.Stats = Stats{}
+		for _, a := range s.Aliases {
+			a.Stats = Stats{}
+		}
+		for _, a := range s.Accounts {
+			a.Stats = Stats{}
+		}
+	case "alias":
+		for _, a := range s.Aliases {
+			if a.ID == id {
+				a.Stats = Stats{}
+				return db.save()
+			}
+		}
+		return errNotFound
+	case "account":
+		for _, a := range s.Accounts {
+			if a.ID == id {
+				a.Stats = Stats{}
+				return db.save()
+			}
+		}
+		return errNotFound
+	default:
+		return errNotFound
+	}
 	return db.save()
 }
 
@@ -633,7 +994,56 @@ func (u *User) clone() *User {
 func (s *Site) clone() *Site {
 	c := *s
 	c.Members = append([]string(nil), s.Members...)
+	// Aliases and accounts hold pointers, so copying the slices alone would hand
+	// the caller the live records. That is not a style point: the site view
+	// blanks a password hash on what it believes is its own copy, and through a
+	// shared pointer that blanks the real credential and the next flush writes
+	// the damage to disk. Traffic counters have the same problem from the other
+	// side — they move while an encoder is reading them.
+	if s.Aliases != nil {
+		c.Aliases = make([]*Alias, len(s.Aliases))
+		for i, a := range s.Aliases {
+			c.Aliases[i] = a.clone()
+		}
+	}
+	if s.Accounts != nil {
+		c.Accounts = make([]*SiteAccount, len(s.Accounts))
+		for i, a := range s.Accounts {
+			c.Accounts[i] = a.clone()
+		}
+	}
 	return &c
+}
+
+func (a *Alias) clone() *Alias {
+	c := *a
+	return &c
+}
+
+func (a *SiteAccount) clone() *SiteAccount {
+	c := *a
+	return &c
+}
+
+// authFingerprint digests every credential the site currently holds. It goes
+// into the memoisation key for verified basic auth, so adding an account,
+// removing one or changing any password invalidates the site's cached entries
+// with no bookkeeping of its own.
+func (s *Site) authFingerprint() string {
+	var b strings.Builder
+	for _, a := range s.Accounts {
+		// The username is in here as well as the hash. Nothing renames an
+		// account today, but this digest is the whole of the invalidation
+		// mechanism, and the day something does, a stale memo would keep letting
+		// the old username in.
+		b.WriteString(a.ID)
+		b.WriteByte(0)
+		b.WriteString(a.User)
+		b.WriteByte(0)
+		b.WriteString(a.Hash)
+		b.WriteByte(0)
+	}
+	return sha256hex(b.String())
 }
 
 func (t *Token) clone() *Token {

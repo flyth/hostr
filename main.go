@@ -25,9 +25,13 @@ import (
 var webFiles embed.FS
 
 type Config struct {
-	Addr          string
-	Data          string
-	AdminDomain   string
+	Addr        string
+	Data        string
+	AdminDomain string
+	// AliasDomain is the parent domain guest links are minted under. Unset means
+	// no guest links: there is no sensible default, since it needs a wildcard
+	// record and a wildcard certificate that only the operator can arrange.
+	AliasDomain   string
 	MaxUpload     int64
 	SecureCookies bool
 	TrustProxy    bool
@@ -56,15 +60,21 @@ func main() {
 		Addr:          env("HOSTR_ADDR", ":8080"),
 		Data:          env("HOSTR_DATA", "/data"),
 		AdminDomain:   normDomain(env("HOSTR_ADMIN_DOMAIN", "")),
+		AliasDomain:   normDomain(env("HOSTR_ALIAS_DOMAIN", "")),
 		MaxUpload:     envInt("HOSTR_MAX_UPLOAD", 100<<20),
 		SecureCookies: env("HOSTR_SECURE_COOKIES", "true") != "false",
 		TrustProxy:    env("HOSTR_TRUST_PROXY", "") == "true",
 	}
 
+	// A typo here would silently disable guest links rather than mint broken
+	// ones, so it stops the server instead.
+	if cfg.AliasDomain != "" && (!domainRe.MatchString(cfg.AliasDomain) || len(cfg.AliasDomain) > 200) {
+		logger.Fatalf("HOSTR_ALIAS_DOMAIN is not a usable domain: %q", cfg.AliasDomain)
+	}
 	if err := os.MkdirAll(cfg.Data, 0o700); err != nil {
 		logger.Fatalf("data directory %s: %v", cfg.Data, err)
 	}
-	db, err := openDB(path.Join(cfg.Data, "hostr.json"))
+	db, err := openDB(path.Join(cfg.Data, "hostr.json"), cfg.AliasDomain)
 	if err != nil {
 		logger.Fatalf("open store: %v", err)
 	}
@@ -94,6 +104,9 @@ func main() {
 	} else {
 		logger.Printf("control panel on https://%s", cfg.AdminDomain)
 	}
+	if cfg.AliasDomain != "" {
+		logger.Printf("guest links under *.%s", cfg.AliasDomain)
+	}
 	if !cfg.SecureCookies {
 		logger.Print("WARNING: HOSTR_SECURE_COOKIES=false — session cookies will be sent over plain HTTP. Local development only.")
 	}
@@ -107,6 +120,17 @@ func main() {
 		IdleTimeout:       2 * time.Minute,
 	}
 
+	// Traffic counters move in memory on every request and land here, so a page
+	// full of images costs no writes at all. The goroutine outlives nothing:
+	// the process exits right after the final flush below.
+	go func() {
+		for range time.Tick(statsFlush) {
+			if err := db.Flush(); err != nil {
+				logger.Printf("writing traffic counters: %v", err)
+			}
+		}
+	}()
+
 	idle := make(chan struct{})
 	go func() {
 		sig := make(chan os.Signal, 1)
@@ -116,6 +140,10 @@ func main() {
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
 			logger.Printf("shutdown: %v", err)
+		}
+		// After the last response, so nothing counted is lost to a clean stop.
+		if err := db.Flush(); err != nil {
+			logger.Printf("writing traffic counters: %v", err)
 		}
 		close(idle)
 	}()
@@ -137,8 +165,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveAdmin(w, r)
 		return
 	}
-	if site := s.db.SiteByDomain(host); site != nil {
-		s.serveSite(w, r, site)
+	if site, alias := s.db.Resolve(host); site != nil {
+		s.serveSite(w, r, site, alias)
 		return
 	}
 	if s.cfg.AdminDomain == "" {

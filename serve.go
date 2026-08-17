@@ -14,16 +14,41 @@ import (
 // serveSite answers a request for a tenant's static site. Everything it can
 // reach is bounded by that site's manifest, so a lookup can never cross into
 // another tenant's blobs even if the path is hostile.
-func (s *Server) serveSite(w http.ResponseWriter, r *http.Request, site *Site) {
+//
+// alias is the guest link the request arrived through, or nil for the site's own
+// domain. Nothing about what gets served depends on it — a guest link is the
+// same site, behind the same password — but everything the response *names* does:
+// a link handed to one person must not disclose where it really points.
+func (s *Server) serveSite(w http.ResponseWriter, r *http.Request, site *Site, alias *Alias) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	// The hostname this request came in on, taken from the stored record rather
+	// than from r.Host: it ends up in an auth realm and in page titles, and a
+	// value out of the request is not one this server ever validated.
+	domain, aliasID := site.Domain, ""
+	if alias != nil {
+		domain, aliasID = alias.Domain, alias.ID
+	}
+
 	// Before anything is disclosed, including whether a path exists.
-	if !s.checkSiteAuth(w, r, site) {
+	account, ok := s.checkSiteAuth(w, r, site, domain)
+	if !ok {
 		return
 	}
+
+	// Past the gate, so this is a real visit and gets counted. A 401 is not: it
+	// carries no traffic worth attributing, and counting it would let any
+	// stranger dirty the store at will. Bytes are always tallied; the hit count
+	// is what a visit costs *once*, so the requests a visit makes on its own
+	// behalf clear this flag as they go — the shared assets, the browser's own
+	// listing feed, and the redirect whose only job is to add a trailing slash
+	// before the client asks again.
+	cw := &countingWriter{ResponseWriter: w}
+	w, counted := http.ResponseWriter(cw), true
+	defer func() { s.db.Record(site.ID, aliasID, account, cw.n, counted) }()
 
 	m := s.storage.Manifest(site.ID)
 	req := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
@@ -32,6 +57,7 @@ func (s *Server) serveSite(w http.ResponseWriter, r *http.Request, site *Site) {
 	// these names. Behind the site's own auth: a private site should not double
 	// as an open font host.
 	if name, ok := assetRequest(req); ok {
+		counted = false
 		s.serveAsset(w, r, name)
 		return
 	}
@@ -40,6 +66,7 @@ func (s *Server) serveSite(w http.ResponseWriter, r *http.Request, site *Site) {
 	// rather than a reserved path prefix, so no filename in a site can ever
 	// collide with it.
 	if r.URL.Query().Get("_hostr") == "ls" {
+		counted = false
 		s.serveListingJSON(w, site, m, req)
 		return
 	}
@@ -55,6 +82,10 @@ func (s *Server) serveSite(w http.ResponseWriter, r *http.Request, site *Site) {
 			if isDir {
 				u := *r.URL
 				u.Path = "/" + req + "/"
+				// The client immediately asks again at the slashed URL, and that
+				// request is the visit. Counting both would double every
+				// navigation that omitted a trailing slash.
+				counted = false
 				http.Redirect(w, r, u.RequestURI(), http.StatusMovedPermanently)
 				return
 			}
@@ -76,7 +107,7 @@ func (s *Server) serveSite(w http.ResponseWriter, r *http.Request, site *Site) {
 				return
 			}
 			if wantsDocument(r) {
-				s.serveMarkdownPage(w, r, site, name)
+				s.serveMarkdownPage(w, r, domain, name)
 				return
 			}
 		}
@@ -86,7 +117,7 @@ func (s *Server) serveSite(w http.ResponseWriter, r *http.Request, site *Site) {
 	// A real directory with no index of its own. Only once the site has opted
 	// in — listing turns every path into something a stranger can enumerate.
 	if site.listable(req) && m.HasDir(req) {
-		s.serveListingPage(w, r, site, req)
+		s.serveListingPage(w, r, site, domain, req)
 		return
 	}
 	s.serveNotFound(w, r, site, m)
@@ -110,7 +141,7 @@ func (s *Server) serveListingJSON(w http.ResponseWriter, site *Site, m *Manifest
 	writeJSON(w, http.StatusOK, map[string]any{"path": dir, "entries": entries})
 }
 
-func (s *Server) serveListingPage(w http.ResponseWriter, r *http.Request, site *Site, dir string) {
+func (s *Server) serveListingPage(w http.ResponseWriter, r *http.Request, site *Site, domain, dir string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
@@ -121,7 +152,7 @@ func (s *Server) serveListingPage(w http.ResponseWriter, r *http.Request, site *
 	// No path or filename is interpolated into markup — the shell is static
 	// and every name arrives later as JSON, so there is nothing here for a
 	// hostile filename to break out of.
-	_, _ = w.Write(listingPage(dir, site.Domain, site.ListingNoRoot, site.Markdown))
+	_, _ = w.Write(listingPage(dir, domain, site.ListingNoRoot, site.Markdown))
 }
 
 // resolve maps a request path onto a manifest entry, trying the file itself,
